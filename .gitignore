@@ -26,3 +26,25 @@ __pycache__/
 *.sqlite3
 instance/
 
+.env
+.venv/
+__pycache__/
+instance/
+*.sqlite3
+*.pyc
+chrome-extension/*.zip
+.env
+.venv/
+__pycache__/
+instance/
+*.sqlite3
+*.pyc
+chrome-extension/*.zip
+.env
+.venv/
+__pycache__/
+instance/
+*.sqlite3
+*.pyc
+chrome-extension/*.zip
+.env
