@@ -49,3 +49,4 @@ instance/
 chrome-extension/*.zip
 .env
 .env
+.env
