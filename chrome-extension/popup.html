@@ -1,46 +1,38 @@
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>PhishGuard</title>
-    <style>
-      body { font-family: system-ui, sans-serif; width: 320px; padding: 12px; }
-      h1 { font-size: 18px; margin: 0 0 8px; }
-      label { display:block; font-size: 12px; margin-top: 8px; }
-      input { width: 100%; padding: 6px; box-sizing: border-box; }
-      button { margin-top: 10px; padding: 8px; width: 100%; }
-      .row { display: flex; gap: 8px; margin-top: 8px; }
-      .row > button { flex: 1; }
-      .small { font-size: 12px; color: #555; }
-      pre { white-space: pre-wrap; word-break: break-all; background: #f5f5f5; padding: 8px; border-radius: 6px; }
-      .ok { color: #117a2f; }
-      .err { color: #a20000; }
-    </style>
-  </head>
-  <body>
-    <h1>PhishGuard</h1>
-    <div id="status" class="small"></div>
+<head>
+  <meta charset="utf-8" />
+  <title>PhishGuard</title>
+  <style>
+    body { width: 320px; font-family: system-ui, sans-serif; color: #eee; background:#111; padding:12px; }
+    input, button { width:100%; margin:6px 0; padding:8px; border-radius:6px; border:1px solid #333; background:#222; color:#eee; }
+    button { background:#2d2d2d; cursor:pointer; }
+    small { opacity:.7 }
+    pre { background:#000; padding:8px; border-radius:6px; max-height:140px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <h3>PhishGuard</h3>
 
-    <label>Email</label>
-    <input id="email" type="email" placeholder="you@example.com" />
+  <!-- Login section -->
+  <input id="email" type="email" placeholder="you@example.com" />
+  <input id="password" type="password" placeholder="Password" />
+  <button id="login">Log in</button>
 
-    <label>Password</label>
-    <input id="password" type="password" placeholder="••••••••" />
+  <!-- Add these buttons/fields -->
+  <div style="display:flex; gap:8px; margin-top:6px;">
+    <button id="me" style="flex:1">/api/me</button>
+    <button id="refresh" style="flex:1">Refresh token</button>
+  </div>
+  <button id="logout">Log out</button>
 
-    <button id="loginBtn">Log in</button>
+  <small>Access token (truncated):</small>
+  <input id="token" readonly />
+  <small>Output:</small>
+  <pre id="output"></pre>
 
-    <div class="row">
-      <button id="meBtn">/api/me</button>
-      <button id="refreshBtn">Refresh token</button>
-    </div>
-
-    <div class="small">Access token (truncated):</div>
-    <pre id="accessOut"></pre>
-
-    <div class="small">Output:</div>
-    <pre id="output"></pre>
-
-    <script src="config.js"></script>
-    <script src="popup.js"></script>
-  </body>
+  <!-- Scripts: config first, then popup -->
+  <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
 </html>

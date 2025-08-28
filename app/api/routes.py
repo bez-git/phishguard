@@ -50,3 +50,4 @@ def me():
     if not user:
         return jsonify(error="user_not_found"), 404
     return jsonify(id=user.id, email=user.email, confirmed=user.is_confirmed), 200
+

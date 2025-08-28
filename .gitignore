@@ -19,3 +19,10 @@ instance/
 # OS
 .DS_Store
 Thumbs.db
+
+.env
+.venv/
+__pycache__/
+*.sqlite3
+instance/
+
