@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>PhishGuard</title>
+    <style>
+      body { font-family: system-ui, sans-serif; width: 320px; padding: 12px; }
+      h1 { font-size: 18px; margin: 0 0 8px; }
+      label { display:block; font-size: 12px; margin-top: 8px; }
+      input { width: 100%; padding: 6px; box-sizing: border-box; }
+      button { margin-top: 10px; padding: 8px; width: 100%; }
+      .row { display: flex; gap: 8px; margin-top: 8px; }
+      .row > button { flex: 1; }
+      .small { font-size: 12px; color: #555; }
+      pre { white-space: pre-wrap; word-break: break-all; background: #f5f5f5; padding: 8px; border-radius: 6px; }
+      .ok { color: #117a2f; }
+      .err { color: #a20000; }
+    </style>
+  </head>
+  <body>
+    <h1>PhishGuard</h1>
+    <div id="status" class="small"></div>
+
+    <label>Email</label>
+    <input id="email" type="email" placeholder="you@example.com" />
+
+    <label>Password</label>
+    <input id="password" type="password" placeholder="••••••••" />
+
+    <button id="loginBtn">Log in</button>
+
+    <div class="row">
+      <button id="meBtn">/api/me</button>
+      <button id="refreshBtn">Refresh token</button>
+    </div>
+
+    <div class="small">Access token (truncated):</div>
+    <pre id="accessOut"></pre>
+
+    <div class="small">Output:</div>
+    <pre id="output"></pre>
+
+    <script src="config.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
