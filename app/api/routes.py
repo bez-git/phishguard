@@ -1,14 +1,18 @@
+# app/api/routes.py
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import (
+    jwt_required, get_jwt_identity,
+    create_access_token, create_refresh_token
+)
 from urllib.parse import urlparse
 
 from ..extensions import db
-from ..models import Report
+from ..models import User, Report
 
-# Mount this blueprint at /api
+# Mount everything under /api
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
-
+# ---------- helpers ----------
 def _is_url(s: str) -> bool:
     try:
         p = urlparse(s)
@@ -16,7 +20,42 @@ def _is_url(s: str) -> bool:
     except Exception:
         return False
 
+# ---------- AUTH API ----------
+@api_bp.route("/login", methods=["POST"])
+def api_login():
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
 
+    if not email or not password:
+        return jsonify({"error": "missing_credentials"}), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not user.check_password(password):
+        return jsonify({"error": "invalid credentials"}), 401
+
+    if not user.is_confirmed:
+        return jsonify({"error": "email_not_confirmed"}), 403
+
+    access  = create_access_token(identity=str(user.id), additional_claims={"email": user.email})
+    refresh = create_refresh_token(identity=str(user.id))
+    return jsonify({"access_token": access, "refresh_token": refresh})
+
+@api_bp.route("/me", methods=["GET"])
+@jwt_required()
+def me():
+    uid = int(get_jwt_identity())
+    u = User.query.get(uid)
+    return jsonify({"id": u.id, "email": u.email, "confirmed": u.is_confirmed})
+
+@api_bp.route("/refresh", methods=["POST"])
+@jwt_required(refresh=True)
+def refresh():
+    uid = get_jwt_identity()
+    new_access = create_access_token(identity=str(uid))
+    return jsonify({"access_token": new_access})
+
+# ---------- REPORT / CHECK ----------
 @api_bp.route("/report", methods=["POST"])
 @jwt_required()
 def make_report():
@@ -32,7 +71,6 @@ def make_report():
     db.session.add(r)
     db.session.commit()
     return jsonify({"ok": True, "id": r.id})
-
 
 @api_bp.route("/reports", methods=["GET"])
 @jwt_required()
@@ -50,12 +88,11 @@ def list_reports():
             "id": r.id,
             "url": r.url,
             "source": r.source,
-            "created_at": r.created_at.isoformat()
+            "created_at": r.created_at.isoformat(),
         } for r in rows
     ])
 
-
-# Stub for ML – will replace with Random Forest
+# Stub until we add the Random Forest model
 @api_bp.route("/check", methods=["POST"])
 @jwt_required()
 def check_url():
