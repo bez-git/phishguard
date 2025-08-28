@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% block content %}
+  <div class="text-center py-5">
+    <h1 class="mb-3">Welcome to PhishGuard</h1>
+    <p class="lead">A starter app with accounts, email verification, and password reset.
+      Add your Chrome Extension and ML model next.</p>
+    <div class="mt-4">
+      <a class="btn btn-primary btn-lg" href="{{ url_for('auth.register') }}">Create an account</a>
+      <a class="btn btn-outline-secondary btn-lg" href="{{ url_for('auth.login') }}">Log in</a>
+    </div>
+  </div>
+{% endblock %}

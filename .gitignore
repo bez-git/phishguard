@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.sqlite3
+.env
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+
+# Flask
+instance/
+.migrations/
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

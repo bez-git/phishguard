@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <div class="card-body">
+    <h3 class="card-title">Dashboard</h3>
+    {% if not user.is_confirmed %}
+      <div class="alert alert-warning">
+        Your email is not confirmed. 
+        <a href="{{ url_for('auth.resend_confirmation') }}">Resend confirmation email</a>.
+      </div>
+    {% endif %}
+    <p class="mb-0">You're logged in as <strong>{{ user.email }}</strong>.</p>
+  </div>
+</div>
+{% endblock %}
