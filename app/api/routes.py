@@ -1,53 +1,51 @@
-# app/api/routes.py
-from flask import Blueprint, jsonify, request
-from flask_jwt_extended import (
-    create_access_token, create_refresh_token,
-    jwt_required, get_jwt_identity
-)
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from urllib.parse import urlparse
 from ..extensions import db
-from ..models import User
+from ..models import Report
 
-api_bp = Blueprint("api", __name__, url_prefix="/api")
+api_bp = Blueprint("api", __name__)
 
-@api_bp.get("/health")
-def health():
-    return jsonify(status="ok"), 200
+def _is_url(s: str) -> bool:
+    try:
+        p = urlparse(s)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
 
-@api_bp.post("/login")
-def api_login():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
-    if not email or not password:
-        return jsonify(error="email and password required"), 400
-
-    user = User.query.filter_by(email=email).first()
-    if not user or not user.check_password(password):
-        return jsonify(error="invalid credentials"), 401
-
-    if not user.is_confirmed:
-        return jsonify(error="email_not_confirmed"), 403
-
-    # 🔧 make identity a STRING
-    access = create_access_token(identity=str(user.id), additional_claims={"email": user.email})
-    refresh = create_refresh_token(identity=str(user.id))
-    return jsonify(access_token=access, refresh_token=refresh), 200
-
-@api_bp.post("/refresh")
-@jwt_required(refresh=True)
-def refresh():
-    # 🔧 convert back to int for DB lookup if needed
-    uid = int(get_jwt_identity())
-    access = create_access_token(identity=str(uid))
-    return jsonify(access_token=access), 200
-
-@api_bp.get("/me")
+@api_bp.route("/report", methods=["POST"])
 @jwt_required()
-def me():
-    # 🔧 convert back to int for DB lookup
+def make_report():
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    source = (data.get("source") or "popup")[:32]
+    if not _is_url(url):
+        return jsonify({"error": "invalid_url"}), 400
     uid = int(get_jwt_identity())
-    user = User.query.get(uid)
-    if not user:
-        return jsonify(error="user_not_found"), 404
-    return jsonify(id=user.id, email=user.email, confirmed=user.is_confirmed), 200
+    r = Report(user_id=uid, url=url[:2048], source=source)
+    db.session.add(r)
+    db.session.commit()
+    return jsonify({"ok": True, "id": r.id})
 
+@api_bp.route("/reports", methods=["GET"])
+@jwt_required()
+def list_reports():
+    uid = int(get_jwt_identity())
+    rows = (Report.query
+            .filter_by(user_id=uid)
+            .order_by(Report.created_at.desc())
+            .limit(50).all())
+    return jsonify([
+        {"id": r.id, "url": r.url, "source": r.source, "created_at": r.created_at.isoformat()}
+        for r in rows
+    ])
+
+# Stub for ML – we’ll replace with RF next week
+@api_bp.route("/check", methods=["POST"])
+@jwt_required()
+def check_url():
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    if not _is_url(url):
+        return jsonify({"error": "invalid_url"}), 400
+    return jsonify({"url": url, "score": 0.50, "label": "unknown"})  # placeholder

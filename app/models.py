@@ -2,6 +2,20 @@ from datetime import datetime
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from .extensions import db, login_manager
+# at top: from datetime import datetime
+from .extensions import db
+
+class Report(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
+    url = db.Column(db.String(2048), nullable=False)
+    source = db.Column(db.String(32), nullable=False, default="popup")
+    note = db.Column(db.String(512))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+# in your existing User model, add (if not there already):
+# reports = db.relationship("Report", backref="user", cascade="all, delete-orphan")
+
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
