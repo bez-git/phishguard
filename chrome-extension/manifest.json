@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PhishGuard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Login to your PhishGuard account and call the API from a Chrome extension.",
   "action": {
     "default_title": "PhishGuard",
@@ -12,14 +12,9 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "permissions": [
-    "storage"
-  ],
+  "permissions": ["storage", "tabs"],
   "host_permissions": [
     "https://www.phishguard.shop/*",
     "https://phishguard.shop/*"
-  ],
-  "background": {
-  "permissions": ["storage"]
-  }
+  ]
 }
