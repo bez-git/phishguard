@@ -2,8 +2,13 @@ from datetime import datetime
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from .extensions import db, login_manager
+
 # at top: from datetime import datetime
 from .extensions import db
+# near your other imports
+from . import models
+
+
 
 class Report(db.Model):
     id = db.Column(db.Integer, primary_key=True)
