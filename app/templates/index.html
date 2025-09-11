@@ -2,8 +2,19 @@
 {% block content %}
   <div class="text-center py-5">
     <h1 class="mb-3">Welcome to PhishGuard</h1>
-    <p class="lead">A starter app with accounts, email verification, and password reset.
-      Add your Chrome Extension and ML model next.</p>
+    <p class="lead">
+      Welcome To PhishGuard, your trusted ally in the fight against phishing attacks. 
+      ED2 Group 7!
+    </p>
+
+    <!-- Logo -->
+    <img
+      src="{{ url_for('static', filename='img/phishguard-logo.png') }}"
+      alt="PhishGuard"
+      class="img-fluid my-3"
+      style="max-width: 420px;"
+    />
+
     <div class="mt-4">
       <a class="btn btn-primary btn-lg" href="{{ url_for('auth.register') }}">Create an account</a>
       <a class="btn btn-outline-secondary btn-lg" href="{{ url_for('auth.login') }}">Log in</a>

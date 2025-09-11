@@ -9,7 +9,15 @@
   <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
       <div class="container">
-        <a class="navbar-brand" href="{{ url_for('main.index') }}">PhishGuard</a>
+        <a class="navbar-brand d-flex align-items-center gap-2" href="{{ url_for('main.index') }}">
+          <img
+            src="{{ url_for('static', filename='img/phishguard-logo.png') }}"
+            alt="PhishGuard"
+            height="150"
+            style="width:auto; display:block;"
+          />
+        </a>
+
         <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarsExample07" aria-controls="navbarsExample07" aria-expanded="false" aria-label="Toggle navigation">
           <span class="navbar-toggler-icon"></span>
         </button>
