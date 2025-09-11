@@ -1,19 +1,23 @@
+# app/__init__.py
 import os
 from datetime import timedelta
 from flask import Flask
+from flask_cors import CORS
 from dotenv import load_dotenv
 
-from .extensions import db, login_manager, mail, migrate, jwt, cors
+from .extensions import db, login_manager, mail, migrate, jwt
 from .auth.routes import auth_bp
 from .main.routes import main_bp
-from .api.routes import api_bp  # <- our API blueprint
+from .api.routes import api_bp  # our API blueprint
 
 def create_app():
+    # Load .env from project root (for local dev)
     base_dir = os.path.abspath(os.path.dirname(__file__))
-    # Load .env from project root when running locally
     load_dotenv(os.path.join(os.path.dirname(base_dir), ".env"))
 
     app = Flask(__name__, instance_relative_config=False)
+
+    # ---- Core config ----
     app.config.from_mapping(
         SECRET_KEY=os.getenv("SECRET_KEY", "dev-secret"),
         SQLALCHEMY_DATABASE_URI=os.getenv("SQLALCHEMY_DATABASE_URI", "sqlite:///phishguard.sqlite3"),
@@ -39,19 +43,29 @@ def create_app():
         JWT_REFRESH_TOKEN_EXPIRES=timedelta(days=7),
     )
 
-    # Init extensions
+    # ---- Init extensions ----
     db.init_app(app)
     migrate.init_app(app, db)
     login_manager.init_app(app)
     mail.init_app(app)
     jwt.init_app(app)
 
-    # CORS (we can tighten later)
-    cors.init_app(app, resources={r"/api/*": {"origins": "*"}})
+    # ---- CORS allowlist for /api/* ----
+    allowed_origins = [
+        "https://phishguard.shop",
+        "https://www.phishguard.shop",
+        "chrome-extension://oobdjflidmpakodnfamfglhblmnjjnmf",  # your extension ID
+        "http://127.0.0.1:5000",  # dev
+    ]
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": allowed_origins}},
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
-    # Blueprints (no extra prefixes here)
+    # ---- Blueprints ----
     app.register_blueprint(auth_bp)
     app.register_blueprint(main_bp)
-    app.register_blueprint(api_bp)
+    app.register_blueprint(api_bp)  # routes.py already has url_prefix="/api"
 
     return app
