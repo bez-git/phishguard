@@ -1,4 +1,5 @@
 # app/api/routes.py
+import os
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import (
     jwt_required, get_jwt_identity,
@@ -20,6 +21,10 @@ def _is_url(s: str) -> bool:
     except Exception:
         return False
 
+def _is_dev() -> bool:
+    # Treat either FLASK_DEBUG=1 or FLASK_ENV=development as dev
+    return os.getenv("FLASK_DEBUG") == "1" or os.getenv("FLASK_ENV") == "development"
+
 # ---------- AUTH API ----------
 @api_bp.route("/login", methods=["POST"])
 def api_login():
@@ -34,7 +39,8 @@ def api_login():
     if not user or not user.check_password(password):
         return jsonify({"error": "invalid credentials"}), 401
 
-    if not user.is_confirmed:
+    # Enforce confirmation in prod, bypass in dev
+    if not user.is_confirmed and not _is_dev():
         return jsonify({"error": "email_not_confirmed"}), 403
 
     access  = create_access_token(identity=str(user.id), additional_claims={"email": user.email})
@@ -101,3 +107,7 @@ def check_url():
     if not _is_url(url):
         return jsonify({"error": "invalid_url"}), 400
     return jsonify({"url": url, "score": 0.50, "label": "unknown"})
+
+@api_bp.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True}), 200
