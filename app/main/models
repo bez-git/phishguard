@@ -1,0 +1,432 @@
+# -------------------------------------------------
+# Enhanced Phishing URL Random Forest Training + Hold-out Eval + Threshold Tuning
+# -------------------------------------------------
+# - Robust label normalization (strings, -1/1, bool-ish)
+# - NO DATA LEAKAGE: impute/encode using TRAIN ONLY, imputers saved to disk
+# - Frequency-encodes TLD (PhiUSIIL) from TRAIN distribution
+# - Saves models, imputers, reports, feature-importance figures
+# - Optional hold-out evaluation on a separate dataset (e.g., Phishing_Websites_Data.csv)
+# - NEW: Tunes an F1-optimal decision threshold on the test split and saves it
+# -------------------------------------------------
+
+import json
+import joblib
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import List, Optional
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, classification_report,
+    precision_recall_curve
+)
+from sklearn.impute import SimpleImputer ## median imputer used.
+#from sklearn.calibration import CalibratedClassifierCV
+import matplotlib.pyplot as plt
+
+# ----------------------
+# Output folders
+# ----------------------
+ROOT = Path(".")
+OUT_MODELS = ROOT / "models"
+OUT_REPORTS = ROOT / "reports"
+OUT_FIGS = ROOT / "figures"
+for p in [OUT_MODELS, OUT_REPORTS, OUT_FIGS]:
+    p.mkdir(parents=True, exist_ok=True)
+
+#Log for the terminal
+def log(msg: str):
+    print(f"[INFO] {msg}")
+
+# ----------------------
+# Label normalization OPEN TO REVIEW****
+# ----------------------
+def normalize_label(series: pd.Series) -> pd.Series:
+    """Normalize labels to {0,1}. Tolerates strings, floats, -1/1, yes/no, etc."""
+    s = series.copy()
+    if s.dtype == "object":
+        s = (
+            s.astype(str).str.strip().str.lower()
+             .replace({
+                 "phishing": "1", "legitimate": "0",
+                 "true": "1", "false": "0", "yes": "1", "no": "0"
+             })
+        )
+    s = pd.to_numeric(s, errors="coerce")
+    s = s.replace({-1: 1, 1: 1, 0: 0})
+    s = s.where(s.isin([0, 1]))
+    return s
+
+def frequency_encode(train_col: pd.Series, test_col: pd.Series): # POSSIBLE ERROR LOCATION***
+    """Frequency-encode a categorical column using TRAIN distribution only."""
+    freqs = train_col.value_counts(normalize=True)
+    train_enc = train_col.map(freqs).fillna(0.0)
+    test_enc = test_col.map(freqs).fillna(0.0)
+    return train_enc, test_enc
+
+# ----------------------
+# PhiUSIIL dataset (diverse features) #OPEN TO REVIEW
+# ----------------------
+def load_phi_dataset(path: str):
+    df = pd.read_csv(path, encoding="ISO-8859-1", on_bad_lines="skip", low_memory=False)
+    df.columns = [c.replace("ï»¿", "") for c in df.columns]
+    if "label" not in df.columns: # POTENTIAL ERROR
+        raise ValueError(f"'label' column not found in {path}.")
+    y = normalize_label(df["label"])#FUNCTION CALL TO NORMALIZE LABELS
+    bad = y.isna()
+    if bad.any():
+        print(f"[WARN] Dropping {bad.sum()} rows with invalid labels in {path}")
+        df = df.loc[~bad].copy()
+        y = y.loc[~bad]
+    X = df.drop(columns=["label"], errors="ignore")
+    # Drop obvious text identifiers; leave TLD for special handling later
+    # Added 'url' to the list of columns to drop
+    drop_cols = [c for c in ["URL", "Domain", "FILENAME", "url"] if c in X.columns]
+    X = X.drop(columns=drop_cols, errors="ignore")
+    # Coerce residual objects to numeric if possible
+    for col in X.columns:
+        if X[col].dtype == "object":
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+    # Replace inf; leave NaNs for train-only imputation later
+    X = X.replace([np.inf, -np.inf], np.nan)
+    has_tld = "TLD" in df.columns
+    return X, y.astype(int), has_tld
+
+def split_and_encode_phi(X, y, raw_df_path, tld_col="TLD", test_size=0.2, seed=42):
+    """Split first; encode TLD via TRAIN distribution; then impute TRAIN-only. Returns the fitted imputer."""
+    # Load the raw dataframe separately to ensure TLD column is available
+    raw_df = pd.read_csv(raw_df_path, encoding="ISO-8859-1", on_bad_lines="skip", low_memory=False)
+    raw_df.columns = [c.replace("ï»¿", "") for c in raw_df.columns]
+
+    idx = np.arange(len(X))
+    X_train_idx, X_test_idx, y_train, y_test = train_test_split(
+        idx, y, stratify=y, test_size=test_size, random_state=seed
+    )
+    X_train_raw = X.iloc[X_train_idx].copy()
+    X_test_raw  = X.iloc[X_test_idx].copy()
+
+    print(f"[DEBUG] X_train_raw shape before TLD encoding: {X_train_raw.shape}")
+
+    # Frequency-encode TLD (learn on TRAIN only)
+    if tld_col in raw_df.columns:
+        t_train = raw_df.iloc[X_train_idx][tld_col].fillna("")
+        t_test  = raw_df.iloc[X_test_idx][tld_col].fillna("")
+        t_train_enc, t_test_enc = frequency_encode(t_train.astype(str), t_test.astype(str))
+        X_train_raw["TLD_freq"] = t_train_enc.values
+        X_test_raw["TLD_freq"]  = t_test_enc.values
+    else:
+        # Add dummy TLD_freq column if TLD is not present
+        X_train_raw["TLD_freq"] = 0.0
+        X_test_raw["TLD_freq"] = 0.0
+
+    print(f"[DEBUG] X_train_raw shape after TLD encoding: {X_train_raw.shape}")
+
+    # Train-only imputation
+    imputer = SimpleImputer(strategy="median")
+    X_train_imputed_array = imputer.fit_transform(X_train_raw)
+    print(f"[DEBUG] X_train_imputed_array shape after imputation: {X_train_imputed_array.shape}")
+
+
+    X_train = pd.DataFrame(
+        X_train_imputed_array,
+        columns=X_train_raw.columns, index=X_train_raw.index # Use columns from X_train_raw after TLD encoding
+    )
+    X_test = pd.DataFrame(
+        imputer.transform(X_test_raw),
+        columns=X_test_raw.columns, index=X_test_raw.index # Use columns from X_test_raw after TLD encoding
+    )
+    return X_train, X_test, y_train, y_test, imputer
+
+# ----------------------
+# Similarity dataset (dataset5; balanced similarity metrics) #ADD NEW DATASET
+# ----------------------
+def load_similarity_dataset(path: str):
+    df = pd.read_csv(path, encoding="ISO-8859-1", on_bad_lines="skip", low_memory=False)
+    # Robust label column detection
+    label_candidates = [c for c in df.columns if c.strip().lower() in
+                        {"label", "phishing", "target", "result", "class", "status"}]
+    if not label_candidates:
+        raise ValueError(f"No label column found in {path}. Columns: {list(df.columns)[:10]} ...")
+    label_col = label_candidates[0]
+    y = normalize_label(df[label_col])
+    bad = y.isna()
+    if bad.any():
+        print(f"[WARN] Dropping {bad.sum()} rows with invalid labels in {path}")
+        df = df.loc[~bad].copy()
+        y = y.loc[~bad]
+    X = df.drop(columns=[label_col], errors="ignore").copy()
+    # Coerce any object columns to numeric if possible (text -> NaN)
+    for col in X.columns:
+        if X[col].dtype == "object":
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+    # Replace inf; leave NaNs for train-only imputation later
+    X = X.replace([np.inf, -np.inf], np.nan)
+    return X, y.astype(int)
+
+# ----------------------
+# RF training & eval
+# ----------------------
+def train_rf(X_train, y_train, n_estimators=500, random_state=42):
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=None,
+        class_weight="balanced",
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    model.fit(X_train, y_train)
+    return model
+
+def evaluate_and_report(model, X_test, y_test, name: str):
+    y_pred = model.predict(X_test)
+
+  #try-catch exception handling
+    try:
+        pos_idx = list(model.classes_).index(1)   # 1 == phishing
+        y_proba = model.predict_proba(X_test)[:, pos_idx]
+        roc = roc_auc_score(y_test, y_proba)
+    except Exception:
+        y_proba = None
+        roc = float("nan")
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    report = classification_report(y_test, y_pred, digits=4) #import from sklearn metrics
+    summary = {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "roc_auc": roc}
+    with open(OUT_REPORTS / f"metrics_{name}.txt", "w") as f:
+        f.write(json.dumps(summary, indent=2))
+        f.write("\n\n")
+        f.write(report)
+    # with open(OUT_REPOSITORY)
+    log(f"[{name}] Accuracy={acc:.4f} | Precision={prec:.4f} | Recall={rec:.4f} | F1={f1:.4f} | ROC-AUC={roc:.4f}")
+    return summary, y_proba
+
+def save_model(model, feature_names: List[str], name: str):
+    joblib.dump(model, OUT_MODELS / f"rf_{name}.pkl")
+    with open(OUT_MODELS / f"rf_{name}_features.txt", "w") as f:
+        for feat in feature_names:
+            f.write(f"{feat}\n")
+    log(f"Saved model to {OUT_MODELS / f'rf_{name}.pkl'}")
+
+def save_imputer(imputer: SimpleImputer, name: str): #WANT TO ADD A "CLEAR CACHE FUNCTION"
+    joblib.dump(imputer, OUT_MODELS / f"imputer_{name}.pkl")
+    log(f"Saved imputer to {OUT_MODELS / f'imputer_{name}.pkl'}")
+
+def plot_feature_importance(model, feature_names: List[str], name: str, top_n=20):
+    importances = model.feature_importances_
+    idx = np.argsort(importances)[::-1][:top_n]
+    plt.figure(figsize=(10, 6))
+    plt.barh([feature_names[i] for i in idx][::-1], importances[idx][::-1])
+    plt.title(f"Top {top_n} Feature Importances - {name}")
+    plt.xlabel("Importance")
+    plt.ylabel("Feature")
+    plt.tight_layout()
+    plt.savefig(OUT_FIGS / f"fi_{name}.png")
+    plt.close()
+
+# ----------------------
+# Threshold tuning (new)
+# ----------------------
+def save_best_threshold(model, X_eval, y_eval, name: str):
+    """
+    Compute the F1-optimal threshold from the precision-recall curve on the eval split (here: test),
+    save it to models/threshold_{name}.txt, and print it.
+    """
+    pos_idx = list(model.classes_).index(1)
+    proba = model.predict_proba(X_eval)[:, pos_idx] #Assuming it is a phishing website
+    prec, rec, thr = precision_recall_curve(y_eval, proba)
+    # precision_recall_curve returns len(thr) = len(prec) - 1
+    f1 = (2 * prec[:-1] * rec[:-1]) / (prec[:-1] + rec[:-1] + 1e-12)
+    best_idx = int(np.nanargmax(f1))
+    best_thr = float(thr[best_idx]) if len(thr) > 0 else 0.5
+    (OUT_MODELS / f"threshold_{name}.txt").write_text(f"{best_thr:.6f}", encoding="utf-8")
+    log(f"[{name}] Tuned best F1 threshold = {best_thr:.4f} (saved to models/threshold_{name}.txt)")
+    return best_thr
+
+# ----------------------
+# Hold-out evaluation #bug located, tweaking program.
+# ----------------------
+def load_and_prepare_holdout(path: str,
+                             drop_text_cols: List[str],
+                             label_candidates: List[str]) -> tuple[pd.DataFrame, Optional[pd.Series]]:
+    """Load a hold-out CSV, normalize label if present, drop obvious text cols, coerce numerics."""
+    df = pd.read_csv(path, encoding="ISO-8859-1", on_bad_lines="skip", low_memory=False)
+    # Try to find label
+    y = None
+    for c in df.columns:
+        if c.strip().lower() in {lc.lower() for lc in label_candidates}:
+            y = normalize_label(df[c])
+            bad = y.isna()
+            if bad.any():
+                df = df.loc[~bad].copy()
+                y = y.loc[~bad]
+            y = y.astype(int)
+            df = df.drop(columns=[c], errors="ignore")
+            break
+    # Drop text-like id columns if present
+    df = df.drop(columns=[c for c in drop_text_cols if c in df.columns], errors="ignore")
+    # Coerce objects to numeric where possible
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = pd.to_numeric(df[col], errors="coerce") # Corrected from X[col] to df[col]
+    df = df.replace([np.inf, -np.inf], np.nan)
+    return df, y
+
+def evaluate_holdout(model_name: str,
+                     model_path: Path,
+                     feature_file: Path,
+                     imputer_path: Path,
+                     holdout_csv: str,
+                     drop_text_cols: List[str],
+                     label_candidates: List[str]):
+    """Align columns to the model's feature order, impute using TRAIN imputer, and evaluate."""
+    # Load artifacts
+    model: RandomForestClassifier = joblib.load(model_path)
+    features = [ln.strip() for ln in feature_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    imputer: SimpleImputer = joblib.load(imputer_path)
+
+    # Load holdout
+    Xh_raw, yh = load_and_prepare_holdout(holdout_csv, drop_text_cols, label_candidates)
+
+    # Add any missing columns expected by the model; extra columns are ignored
+    for col in features:
+        if col not in Xh_raw.columns:
+            Xh_raw[col] = np.nan
+
+    # Reorder columns to the model's feature order
+    Xh_raw = Xh_raw[features]
+
+    # Impute with TRAIN imputer
+    Xh = pd.DataFrame(imputer.transform(Xh_raw), columns=Xh_raw.columns, index=Xh_raw.index)
+
+    # Predict and (if labels exist) score
+    y_pred = model.predict(Xh)
+    if yh is not None and len(yh) == len(Xh):
+        try:
+            pos_idx = list(model.classes_).index(1)
+            y_proba = model.predict_proba(Xh)[:, pos_idx]
+            roc = roc_auc_score(yh, y_proba)
+        except Exception:
+            roc = float("nan")
+        acc = accuracy_score(yh, y_pred)
+        prec = precision_score(yh, y_pred, zero_division=0)
+        rec = recall_score(yh, y_pred, zero_division=0)
+        f1 = f1_score(yh, y_pred, zero_division=0)
+        report = classification_report(yh, y_pred, digits=4)
+        with open(OUT_REPORTS / f"metrics_holdout_{model_name}.txt", "w") as f:
+            f.write(json.dumps(
+                {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "roc_auc": roc}, indent=2
+            ))
+            f.write("\n\n")
+            f.write(report)
+        log(f"[holdout:{model_name}] Accuracy={acc:.4f} | Precision={prec:.4f} | Recall={rec:.4f} | F1={f1:.4f} | ROC-AUC={roc:.4f}")
+    else:
+        # No labels found; just save predictions
+        out_csv = OUT_REPORTS / f"predictions_holdout_{model_name}.csv"
+        pd.DataFrame({"prediction": y_pred}).to_csv(out_csv, index=False, encoding="utf-8")
+        log(f"[holdout:{model_name}] Saved predictions to {out_csv} (no labels found).")
+
+# ----------------------
+# Main
+# ----------------------
+def main(
+    phi_path="training_set.csv",
+    sim_path="validation_set.csv",
+    holdout_path: Optional[str] = None,  # e.g., "Phishing_Websites_Data.csv"
+    test_size=0.2,
+    seed=42
+):
+    # ---- PhiUSIIL ----
+    log("Loading training_set.csv ...")
+    X_phi_raw, y_phi, _ = load_phi_dataset(phi_path)
+    X_phi_train, X_phi_test, y_phi_train, y_phi_test, phi_imputer = split_and_encode_phi(
+        X_phi_raw, y_phi, raw_df_path=phi_path, tld_col="TLD", test_size=test_size, seed=seed
+    )
+    print("[DEBUG] Phi label values:", sorted(pd.Series(y_phi).unique().tolist()))
+
+    # ---- Similarity (split -> drop all-NaN cols -> impute TRAIN-only) ----
+    log("Loading validation_set.csv...")
+    X_sim_raw, y_sim = load_similarity_dataset(sim_path)
+    X_sim_train_raw, X_sim_test_raw, y_sim_train, y_sim_test = train_test_split(
+        X_sim_raw, y_sim, stratify=y_sim, test_size=test_size, random_state=seed
+    )
+    # Drop any all-NaN columns (e.g., pure text) from TRAIN and align TEST
+    all_nan_cols = [c for c in X_sim_train_raw.columns if X_sim_train_raw[c].notna().sum() == 0]
+    if all_nan_cols:
+        print(f"[INFO] Dropping all-NaN columns in Similarity train: {all_nan_cols}")
+        X_sim_train_raw = X_sim_train_raw.drop(columns=all_nan_cols)
+        X_sim_test_raw = X_sim_test_raw.drop(columns=[c for c in all_nan_cols if c in X_sim_test_raw.columns])
+
+    sim_imputer = SimpleImputer(strategy="median")
+    X_sim_train = pd.DataFrame(
+        sim_imputer.fit_transform(X_sim_train_raw),
+        columns=X_sim_train_raw.columns, index=X_sim_train_raw.index
+    )
+    X_sim_test = pd.DataFrame(
+        sim_imputer.transform(X_sim_test_raw),
+        columns=X_sim_test_raw.columns, index=X_sim_test_raw.index
+    )
+    print("[DEBUG] Sim label values:", sorted(pd.Series(y_sim).unique().tolist()))
+
+    # ---- Train & Evaluate ----
+    log("Training RF on training_set.csv...")
+    rf_phi = train_rf(X_phi_train, y_phi_train)
+    # OPTIONAL: probability calibration (disabled for now)
+    # rf_phi = CalibratedClassifierCV(rf_phi, method="isotonic", cv=3).fit(X_phi_train, y_phi_train)
+    (phi_summary, phi_proba_unused) = evaluate_and_report(rf_phi, X_phi_test, y_phi_test, "phi")
+    save_model(rf_phi, X_phi_train.columns.tolist(), "phi")
+    save_imputer(phi_imputer, "phi")
+    plot_feature_importance(rf_phi, X_phi_train.columns.tolist(), "phi")
+    # Threshold tuning (on test split)
+    save_best_threshold(rf_phi, X_phi_test, y_phi_test, "phi")
+
+    log("Training RF on validation_set.csv...")
+    rf_sim = train_rf(X_sim_train, y_sim_train)
+    # OPTIONAL: probability calibration (disabled for now)
+    # rf_sim = CalibratedClassifierCV(rf_sim, method="isotonic", cv=3).fit(X_sim_train, y_sim_train)
+    (sim_summary, sim_proba_unused) = evaluate_and_report(rf_sim, X_sim_test, y_sim_test, "sim")
+    save_model(rf_sim, X_sim_train.columns.tolist(), "sim")
+    save_imputer(sim_imputer, "sim")
+    plot_feature_importance(rf_sim, X_sim_train.columns.tolist(), "sim")
+    # Threshold tuning (on test split)
+    save_best_threshold(rf_sim, X_sim_test, y_sim_test, "sim")
+
+    # ---- Optional hold-out evaluation ----
+    if holdout_path:
+        log(f"Running hold-out evaluation on: {holdout_path}")
+        text_cols = ["URL", "Domain", "FILENAME", "url", "domain", "filename"]
+        label_names = ["Result", "Label", "label", "status", "class", "phishing", "target"]
+
+        evaluate_holdout(
+            model_name="phi",
+            model_path=OUT_MODELS / "rf_phi.pkl",
+            feature_file=OUT_MODELS / "rf_phi_features.txt",
+            imputer_path=OUT_MODELS / "imputer_phi.pkl",
+            holdout_csv=holdout_path,
+            drop_text_cols=text_cols,
+            label_candidates=label_names
+        )
+        evaluate_holdout(
+            model_name="sim",
+            model_path=OUT_MODELS / "rf_sim.pkl",
+            feature_file=OUT_MODELS / "rf_sim_features.txt",
+            imputer_path=OUT_MODELS / "imputer_sim.pkl",
+            holdout_csv=holdout_path,
+            drop_text_cols=text_cols,
+            label_candidates=label_names
+        )
+
+    log("Done. Reports in 'reports/', models in 'models/', figures in 'figures/'.")
+
+if __name__ == "__main__":
+    # Example: set holdout_path to "Phishing_Websites_Data.csv" to evaluate generalization
+    main(
+        phi_path="/content/training_set.csv",
+        sim_path="/content/validation_set.csv",
+        holdout_path="/content/PhiUSIIL_Phishing_URL_Dataset.csv"
+    )
