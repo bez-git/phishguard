@@ -2,7 +2,7 @@ from datetime import datetime
 from flask import Blueprint, render_template, redirect, url_for, flash, request
 from flask_login import login_user, logout_user, login_required, current_user
 from ..extensions import db
-from ..models import User
+from ..predictions.models import User
 from .forms import RegisterForm, LoginForm, RequestResetForm, ResetPasswordForm
 from ..email_utils import generate_token, verify_token, send_email
 

@@ -8,7 +8,7 @@ from flask_jwt_extended import (
 from urllib.parse import urlparse
 
 from ..extensions import db
-from ..models import User, Report
+from ..predictions.models import User, Report
 
 # Mount everything under /api
 api_bp = Blueprint("api", __name__, url_prefix="/api")
