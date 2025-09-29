@@ -7,7 +7,70 @@ import os
 import numpy as np
 import threading
 
-import Core_Machine_Learning_Algorithm as mla  # your module
+from . import models as mla  # your module
+from __future__ import annotations
+import os, json, pickle
+import joblib
+
+# Where artifacts live by default
+# Directory where model artifacts (trained model, threshold, feature order) are stored
+_ART_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
+
+# Path to the trained model file (can be overridden by PHISH_MODEL_PATH environment variable)
+_MODEL_PATH = os.getenv("PHISH_MODEL_PATH", os.path.join(_ART_DIR, "phish_rf.joblib"))
+
+# Path to the threshold file (can be overridden by PHISH_THRESHOLD_PATH environment variable)
+_THRESHOLD_PATH = os.getenv("PHISH_THRESHOLD_PATH", os.path.join(_ART_DIR, "threshold.json"))
+
+# Path to the feature order file (can be overridden by PHISH_FEATURE_ORDER_PATH environment variable)
+_FEATURE_ORDER_PATH = os.getenv("PHISH_FEATURE_ORDER_PATH", os.path.join(_ART_DIR, "feature_order.json"))
+
+def _load_artifact(path: str):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".joblib", ".jl"):
+        return joblib.load(path)
+    # default to pickle (.pkl / .pickle)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+def load_model():
+    """Return a fitted sklearn estimator or a dict bundle with 'model' and (optionally) 'feature_order'."""
+    # SECURITY: only load from trusted paths!
+    return _load_artifact(_MODEL_PATH)
+
+def load_feature_order():
+    """Return list[str] feature names in serving order, or None if bundled in the model."""
+    try:
+        if os.path.exists(_FEATURE_ORDER_PATH):
+            with open(_FEATURE_ORDER_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list) and all(isinstance(x, str) for x in data):
+                return data
+    except Exception:
+        pass
+    return None
+
+def get_threshold(default: float = 0.5) -> float:
+    """Return F1-opt threshold if available; default 0.5 (env PHISH_THRESHOLD overrides)."""
+    # JSON file (preferred)
+    try:
+        if os.path.exists(_THRESHOLD_PATH):
+            with open(_THRESHOLD_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            t = float(data.get("f1_opt", default))
+            if 0.0 <= t <= 1.0:
+                return t
+    except Exception:
+        pass
+    # ENV override
+    try:
+        t_env = float(os.getenv("PHISH_THRESHOLD", default))
+        if 0.0 <= t_env <= 1.0:
+            return t_env
+    except Exception:
+        pass
+    return default
+
 
 # -------------------------------------------------
 # Flask setup
