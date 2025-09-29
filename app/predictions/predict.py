@@ -19,14 +19,18 @@ logging.basicConfig(level=logging.INFO)
 # -------------------------------------------------
 # Global, lazy-loaded artifacts (no training here)
 # -------------------------------------------------
-_model = None
-_feature_order = None
-_pos_idx = 1             # default positive class index; will be inferred
-_label_map = {0: "legit", 1: "phish"}  # adjust if you used strings during training
-_lock = threading.Lock()
+# Global variables for lazy-loaded model artifacts
+_model = None                # The trained model instance (loaded once)
+_feature_order = None        # List of feature names in model order
+_pos_idx = 1                 # Default positive class index; will be inferred from model
+_label_map = {0: "legit", 1: "phish"}  # Maps model output to labels; adjust if using string labels
+_lock = threading.Lock()     # Thread lock for safe lazy loading
 
 def _try_getattr(obj, names):
-    """Return first existing attribute by name list, else None."""
+    """
+    Return the first existing attribute from a list of possible names, or None if not found.
+    Used to flexibly access loader functions or properties in the MLA module.
+    """
     for n in names:
         if hasattr(obj, n):
             return getattr(obj, n)
@@ -36,14 +40,19 @@ def _load_feature_order():
     """
     Try several conventional functions in your mla module to load feature order.
     Adjust the candidate names if your module differs.
+
+    Returns:
+        list[str] | None: The feature order as a list of strings, or None if not found.
     """
+    # Try to get a loader function or property from the MLA module
     loader = _try_getattr(mla, [
-        "load_feature_order",          # you mentioned this
-        "get_feature_order",
-        "feature_order",
+        "load_feature_order",          # Preferred: explicit loader
+        "get_feature_order",           # Alternative: getter
+        "feature_order",               # Alternative: direct property
     ])
     if callable(loader):
         fo = loader()
+        # Ensure the returned value is a list/tuple of strings
         if isinstance(fo, (list, tuple)) and all(isinstance(x, str) for x in fo):
             return list(fo)
     # Fallback: if your model bundle carries the order, leave None here; we’ll infer later.
@@ -51,37 +60,40 @@ def _load_feature_order():
 
 def _load_model_bundle():
     """
-    Prefer a load function that returns a fitted model (and optionally feature_order).
-    Do NOT call any training function here.
+    Loads the trained model and feature order from the Core_Machine_Learning_Algorithm module.
+    Tries several conventional loader function names. Returns:
+        (model, feature_order, pos_label)
     """
     # Try common loader names in Core_Machine_Learning_Algorithm
     load_fn = _try_getattr(mla, [
         "load_model",                  # ideal: returns fitted model (and maybe metadata)
         "load_rf",                     # if you saved a specific RF
-        "restore_model",
-        "get_trained_model",
+        "restore_model",               # alternative loader name
+        "get_trained_model",           # another possible loader name
     ])
 
     if callable(load_fn):
         bundle = load_fn()
         # Accept either raw estimator or dict bundle
         if isinstance(bundle, dict):
+            # If loader returns a dict, extract model, feature order, and positive label
             model = bundle.get("model", None)
             fo = bundle.get("feature_order", None) or _load_feature_order()
             pos_label = bundle.get("pos_label", 1)
             return model, fo, pos_label
         else:
+            # If loader returns just the model, infer feature order and use default pos_label
             return bundle, _load_feature_order(), 1
 
-    # LAST RESORT (only if you absolutely have no saved model loader):
-    # If your train_rf() *returns a fitted model* without retraining expensively, you can keep it.
-    # Otherwise, comment this out to avoid training inside API.
+    # LAST RESORT: fallback to training if no loader is found
+    # Only use this if train_rf() returns a fitted model without retraining
     train_fn = _try_getattr(mla, ["train_rf"])
     if callable(train_fn):
         logging.warning("No explicit load_model() found; using train_rf() as a fallback loader.")
         model = train_fn()
         return model, _load_feature_order(), 1
 
+    # If no loader or trainer is found, raise an error
     raise RuntimeError("No model loader found in Core_Machine_Learning_Algorithm.")
 
 def _infer_positive_index(model):
@@ -90,26 +102,41 @@ def _infer_positive_index(model):
     We assume '1' => phish as a convention; if your classes_ are strings, we look for 'phish'.
     Otherwise we fall back to the last column.
     """
-    pos_idx = 1
-    classes = getattr(model, "classes_", None)
+    pos_idx = 1  # Default to index 1 (second column)
+    classes = getattr(model, "classes_", None)  # Try to get model's class labels
+
     if classes is None:
+        # If model does not have classes_, return default
         return pos_idx
 
     # numpy array or list
     try:
         if 1 in classes:
-            # standard case: {0,1} with 1 = phishing
+            # Standard case: classes are [0, 1], with 1 = phishing
             pos_idx = int(np.where(classes == 1)[0][0])
         elif "phish" in classes:
+            # If classes are string labels, look for "phish"
             pos_idx = int(np.where(classes == "phish")[0][0])
         else:
+            # Fallback: use last column
             pos_idx = len(classes) - 1
     except Exception:
+        # If any error, fallback to index 1 if possible, else 0
         pos_idx = 1 if len(classes) > 1 else 0
 
     return pos_idx
 
 def _label_from_score(score: float, threshold: float) -> str:
+    """
+    Returns the label ("phish" or "legit") based on the score and threshold.
+
+    Args:
+        score (float): The predicted probability for the positive class.
+        threshold (float): The decision threshold.
+
+    Returns:
+        str: "phish" if score >= threshold, else "legit".
+    """
     return "phish" if score >= threshold else "legit"
 
 def _threshold():
@@ -117,42 +144,51 @@ def _threshold():
     Optional: pull an F1-optimal threshold from your module or env var.
     Defaults to 0.5 if not set.
     """
-    # Try mla accessor
+    # Try to get threshold from the MLA module (e.g., get_threshold or load_threshold)
     get_thr = _try_getattr(mla, ["get_threshold", "load_threshold"])
     if callable(get_thr):
         try:
             t = float(get_thr())
             if 0.0 <= t <= 1.0:
-                return t
+                return t  # Use threshold from MLA module if valid
         except Exception:
-            pass
+            pass  # Ignore errors and continue
 
-    # Environment override
+    # Try to get threshold from environment variable PHISH_THRESHOLD
     t_env = os.getenv("PHISH_THRESHOLD", "")
     try:
         t = float(t_env)
         if 0.0 <= t <= 1.0:
-            return t
+            return t  # Use threshold from environment if valid
     except Exception:
-        pass
+        pass  # Ignore errors and continue
 
+    # Default threshold if none found
     return 0.5
 
 def _ensure_loaded():
     """
     Lazy-load model, feature order, and positive class index once, thread-safe.
+
+    Ensures that the model and its metadata are loaded only once, even if multiple
+    threads access the API simultaneously. Uses a thread lock for safety.
     """
     global _model, _feature_order, _pos_idx
     if _model is not None:
+        # Already loaded, nothing to do
         return
     with _lock:
         if _model is not None:
+            # Double-checked locking: another thread may have loaded it
             return
+        # Load model, feature order, and positive label index from the MLA module
         model, fo, pos_label = _load_model_bundle()
         if model is None:
+            # If loading failed, raise an error
             raise RuntimeError("Model failed to load.")
         _model = model
         _feature_order = fo
+        # If pos_label is None, infer positive index from model; otherwise, use pos_label
         _pos_idx = _infer_positive_index(_model) if pos_label is None else _infer_positive_index(_model)
 
 # -------------------------------------------------
@@ -160,28 +196,60 @@ def _ensure_loaded():
 # -------------------------------------------------
 def _vector_from_payload(features, feature_order):
     """
-    Accepts dict (preferred) or list. Returns 2D array shape (1, n_features).
+    Converts input features (dict or list) into a 2D numpy array for model prediction.
+
+    Args:
+        features (dict or list): Feature values, either as a dict {name: value} or a list [v1, v2, ...].
+        feature_order (list[str]): List of feature names in model order (required for dict input).
+
+    Returns:
+        np.ndarray: Array of shape (1, n_features) suitable for model input.
+
+    Raises:
+        ValueError: If feature order is unknown for dict input, or list length mismatches feature order.
+        TypeError: If features is not a dict or list.
     """
     if isinstance(features, dict):
+        # Map dict values to model order; missing keys default to 0
         if not feature_order:
             raise ValueError("Feature order is unknown; cannot map dict to vector.")
         vec = [features.get(k, 0) for k in feature_order]
         return np.asarray(vec, dtype=float).reshape(1, -1)
 
     if isinstance(features, list):
+        # If feature order is known, check length matches
         if feature_order and len(features) != len(feature_order):
             raise ValueError(f"Expected {len(feature_order)} features, got {len(features)}.")
         return np.asarray(features, dtype=float).reshape(1, -1)
 
+    # Invalid input type
     raise TypeError("'features' must be a list or a dict of name->value.")
 
 # -------------------------------------------------
 # Routes
 # -------------------------------------------------
+# -------------------------------------------------
+# Health check endpoint
+# -------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
+    """
+    GET /health
+
+    Returns basic health and model status info.
+    Checks if the model is loaded and returns metadata.
+
+    Response:
+    {
+        "ok": True,
+        "model_loaded": True,
+        "n_features_in": <number of input features>,
+        "classes": <model class labels>,
+        "feature_order_known": True|False
+    }
+    """
     try:
-        _ensure_loaded()
+        _ensure_loaded()  # Make sure model is loaded
         classes = getattr(_model, "classes_", None)
         return jsonify({
             "ok": True,
@@ -194,10 +262,25 @@ def health():
         logging.exception("Health check failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# -------------------------------------------------
+# Feature order endpoint
+# -------------------------------------------------
 @app.route("/feature_order", methods=["GET"])
 def feature_order_endpoint():
+    """
+    GET /feature_order
+
+    Returns the feature order used by the model.
+
+    Response:
+    {
+        "ok": True,
+        "feature_order": [list of feature names],
+        "count": <number of features>
+    }
+    """
     try:
-        _ensure_loaded()
+        _ensure_loaded()  # Make sure model is loaded
         return jsonify({
             "ok": True,
             "feature_order": _feature_order or [],
@@ -209,12 +292,15 @@ def feature_order_endpoint():
 @app.route("/predict", methods=["POST"])
 def predict():
     """
-    Body:
+    POST /predict
+
+    Request Body:
     {
       "features": {name: value, ...}   # preferred (dict)
       # or
       "features": [v1, v2, ...]        # list in model order
     }
+
     Response:
     {
       "ok": true,
@@ -226,27 +312,34 @@ def predict():
     }
     """
     try:
-        _ensure_loaded()
+        _ensure_loaded()  # Ensure model and metadata are loaded
 
+        # Parse JSON body from request
         data = request.get_json(force=True, silent=False)
         if not data or "features" not in data:
+            # Missing features in request
             return jsonify({"ok": False, "error": "Missing 'features' in JSON body."}), 400
 
+        # Convert input features to numpy array in model order
         X = _vector_from_payload(data["features"], _feature_order)
         if not hasattr(_model, "predict_proba"):
+            # Model does not support probability prediction
             return jsonify({"ok": False, "error": "Model has no predict_proba()."}), 500
 
+        # Get probability predictions from model
         proba = _model.predict_proba(X)
         if proba.shape[1] == 1:
-            # Some models output a single-column proba for the positive class
+            # Some models output a single probability column
             score = float(proba[0, 0])
         else:
+            # Use the positive class index for phishing probability
             score = float(proba[0, _pos_idx])
 
-        thr = _threshold()
-        label = _label_from_score(score, thr)
+        thr = _threshold()  # Get decision threshold
+        label = _label_from_score(score, thr)  # Map score to label
 
         logging.info(f"Predicted label={label}, score={score:.4f}")
+        # Return prediction result
         return jsonify({
             "ok": True,
             "label": label,
@@ -257,6 +350,7 @@ def predict():
         }), 200
 
     except Exception as e:
+        # Log and return error details
         logging.exception("Prediction error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
