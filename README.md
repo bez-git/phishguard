@@ -1,69 +1,81 @@
 # PhishGuard
 
-A Flask backend + Chrome MV3 extension for reporting suspicious URLs and (soon) returning phishing risk scores from a machine-learning model.
+A Flask backend + Chrome MV3 extension for **real-time phishing risk detection**.  
+The extension sends page/link URLs to the API; the API serves a trained ML model and returns a **label + score**.
 
 ---
 
-## Status
+## Status (Oct 2025)
 
-- **Backend**: Flask app with app-factory pattern and JWT-secured REST endpoints is live.  
-- **Auth & Data**: Users, JWT login/refresh, and URL reporting are implemented with a relational DB.  
-- **Chrome Extension (MV3)**: Popup can authenticate, fetch `/api/me`, submit URL reports, and display recent reports.  
-- **ML Integration**: `/api/check` exists as a **stub**; model inference wiring is planned next.  
-- **Deployment**: Deployed on Render with a custom domain.  
-- **Environments**: SQLite for local dev; Postgres in production.
-
----
-
-## Features (Current)
-
-### Backend (Flask)
-- App factory + Blueprints (web/auth/API)
-- JWT auth and email confirm flow (enforced in prod; bypassed in dev)
-- Database models: `User`, `Report (user_id, url, source, created_at)`
-- Health check endpoint
-
-### Chrome Extension (MV3)
-- Login and token handling
-- Report current tab URL to the backend
-- View recent reports
-- Switchable API base (local vs prod) via `config.js`
+- **Backend**: Flask app (app-factory + Blueprints) with **JWT auth** is live.
+- **ML Serving**: Model **wired in** (`rf_phi.pkl` + `imputer_phi.pkl`) with `feature_order.json` and optional `tld_freq.json`. Safe NaN handling and light post-processing (IP+login bump; HTTPS .gov/.edu de-escalation).
+- **Data**: `/api/report` persists URL + `score`, `label`, `evaluated_at` (migration added).
+- **Extension (MV3)**: Auto check on tab change/complete, **badge** (PH/! or count), notifications, link autoscan & caching, popup with login and “Scan Page”.
+- **Deploy**: App + Postgres on **Render** (custom domain), CORS set; Mailtrap for dev mail.
 
 ---
 
-## API (Current Endpoints)
+## API (quick list)
 
-- `POST /api/login` → `{ access_token, refresh_token }`  
-- `POST /api/refresh` → issue a new access token  
-- `GET /api/me` → current user (requires access token)  
-- `POST /api/report` → store a reported URL (requires access token)  
-- `GET /api/reports` → latest reports (requires access token)  
-- `POST /api/check` → **stub**: `{ url, score: 0.5, label: "unknown" }`  
-- `GET /api/health` → `{ ok: true }`
+**Auth**
+- `POST /api/login` → `{ access_token, refresh_token }`
+- `POST /api/refresh` → `{ access_token }`
+- `GET  /api/me` → current user (Bearer access token)
 
-> **Note:** Model inference is not live yet; `/api/check` is a placeholder until the feature extractor + model loader are integrated.
+**Scoring**
+- `POST /api/check` → `{ ok, url, label: phish|suspicious|legit, score, threshold }`
+- `GET  /api/health` → model/threshold info
+- `GET  /api/debug_check?url=...` → features + imputed vector + scores
+
+**Reports**
+- `POST /api/report`   → store a report (auth)
+- `GET  /api/reports`  → recent reports (auth)
 
 ---
 
-## Quickstart (Dev)
 
-```bash
-# From project root
+## Quickstart (dev)
+
+```powershell
+# Windows PowerShell (on macOS/Linux: create venv + activate accordingly)
 python -m venv .venv
-# Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
-# macOS/Linux:
-# source .venv/bin/activate
-
 pip install -r requirements.txt
 
-# Local environment
-copy .env.example .env  # then edit SECRET_KEY, JWT_SECRET_KEY, SQLALCHEMY_DATABASE_URI, Mailtrap if used
 
-# Database
-$env:FLASK_APP="wsgi.py"
+Create .env in repo root (minimal):
+
+FLASK_ENV=development
+FLASK_DEBUG=1
+SECRET_KEY=change-me
+JWT_SECRET_KEY=change-me-too
+SQLALCHEMY_DATABASE_URI=sqlite:///phishguard.sqlite3
+PHISH_THRESHOLD=0.90
+PHISH_NAN_DEFAULT=0.5
+
+Run DB + server:
+
+$env:FLASK_APP = "wsgi.py"
 flask db upgrade
+flask run --reload --port 5000
 
-# Run (dev; email confirm bypassed when FLASK_DEBUG=1)
-$env:FLASK_DEBUG="1"
-flask run
+
+Smoke test:
+
+Invoke-RestMethod http://127.0.0.1:5000/api/health
+
+
+1 Chrome extension (dev)
+2 Open chrome://extensions → enable Developer mode → Load unpacked → phishguard_chrome_extension_v2/.
+Edit phishguard_chrome_extension_v2/config.js:
+const CONFIG = { API_BASE: "http://127.0.0.1:5000" }; // use prod URL on deployment
+3 Click the extension → Log in → Scan Page. Badge + notifications will appear as you browse.
+
+
+
+
+Deploy (Render)
+
+Set env vars: FLASK_ENV=production, strong SECRET_KEY & JWT_SECRET_KEY, SQLALCHEMY_DATABASE_URI (Postgres), optional PHISH_THRESHOLD, Mailtrap.
+After build, run: FLASK_APP=wsgi.py flask db upgrade.
+Point the extension API_BASE to your domain (e.g., https://www.phishguard.shop).
