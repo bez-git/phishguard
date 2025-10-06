@@ -9,31 +9,32 @@ import numpy as np
 from flask import Blueprint, jsonify, request
 
 # -------------------------------------------------
-# Artifact paths (phi model)
+# Artifact paths (ENV-overridable)
 # -------------------------------------------------
 _ART_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
 
 _MODEL_PATH = os.getenv("PHISH_MODEL_PATH",
-                        os.path.join(_ART_DIR, "rf_phi.pkl"))
+                        os.path.join(_ART_DIR, "phish_rf.joblib"))
 _THRESHOLD_PATH = os.getenv("PHISH_THRESHOLD_PATH",
                             os.path.join(_ART_DIR, "threshold.json"))
 _FEATURE_ORDER_PATH = os.getenv("PHISH_FEATURE_ORDER_PATH",
                                 os.path.join(_ART_DIR, "feature_order.json"))
 _IMPUTER_PATH = os.getenv("PHISH_IMPUTER_PATH",
-                          os.path.join(_ART_DIR, "imputer_phi.pkl"))
-# Optional: training-time TLD frequency map ({"com":0.42,"net":0.09,...})
+                          os.path.join(_ART_DIR, "imputer_phi.joblib"))
 _TLD_FREQ_PATH = os.getenv("PHISH_TLD_FREQ_PATH",
                            os.path.join(_ART_DIR, "tld_freq.json"))
 
-# Built-in fallback order if feature_order.json is missing
+# Built-in fallback order (used only if feature_order.json is missing)
+# NOTE: 12 features, no "label".
 DEFAULT_PHI_FEATURE_ORDER = [
     "url_length",
     "dot_count",
     "hyphen_count",
     "at_symbol_present",
     "has_ip_address",
-    "domain_age_days",
+    "is_asset_url",
     "num_subdomains",
+    "is_trusted_tld",
     "num_iframes",
     "num_password_inputs",
     "num_js_redirects",
@@ -54,6 +55,14 @@ _NEUTRALIZE_FEATURES = {
 
 # De-escalation allowlist by TLD only (HTTPS + non-punycode)
 _ALLOWLIST_TLDS = (".gov", ".edu")
+
+# Helpers for new schema
+_ASSET_RE = re.compile(
+    r"\.(?:png|jpe?g|gif|svg|ico|webp|css|js|mjs|map|json|woff2?|ttf|eot|otf|mp4|mp3|webm|pdf|zip|rar|7z|gz|tar)(?:\?.*)?$",
+    re.IGNORECASE,
+)
+# Keep conservative; we also treat "trusted" if its training frequency is high enough.
+_TRUSTED_TLDS = {"gov", "edu"}
 
 # Registered in app/__init__.py as: from .predictions.predict import bp as ml_bp
 bp = Blueprint("ml", __name__, url_prefix="/api")
@@ -107,16 +116,24 @@ def _load_tld_freq():
         logging.exception("tld_freq.json read failed; ignoring")
 
 def _get_threshold(default: float = 0.85) -> float:
-    """From file (threshold/f1_opt) or env PHISH_THRESHOLD, else default."""
+    """From file (supports dict with 'f1_opt'/'threshold' or bare number) or env PHISH_THRESHOLD."""
     try:
         if os.path.exists(_THRESHOLD_PATH):
             with open(_THRESHOLD_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for k in ("threshold", "f1_opt"):
-                if k in data:
-                    t = float(data[k])
-                    if 0.0 <= t <= 1.0:
-                        return t
+                raw = f.read().strip()
+            try:
+                j = json.loads(raw)
+                if isinstance(j, dict):
+                    for k in ("threshold", "f1_opt"):
+                        if k in j and 0.0 <= float(j[k]) <= 1.0:
+                            return float(j[k])
+                elif isinstance(j, (int, float)) and 0.0 <= float(j) <= 1.0:
+                    return float(j)
+            except Exception:
+                # allow plain text number
+                val = float(raw)
+                if 0.0 <= val <= 1.0:
+                    return val
     except Exception:
         pass
     try:
@@ -179,6 +196,7 @@ def _extract_phi_features(url: str) -> dict[str, float]:
     parsed = urlparse(u)
     host = (parsed.hostname or "").lower()
     url_s = u
+    path = parsed.path or ""
 
     # Best-effort TLD
     tld = ""
@@ -188,11 +206,14 @@ def _extract_phi_features(url: str) -> dict[str, float]:
     except Exception:
         tld = ""
 
-    # TLD_freq: use training map if present, else mean, else NaN (let neutralizer handle)
+    # TLD_freq: use training map if present, else mean, else NaN
     if _tld_freq_map:
         tld_val = _tld_freq_map.get(tld, _tld_freq_mean if _tld_freq_mean is not None else np.nan)
     else:
         tld_val = np.nan
+
+    is_trusted = 1.0 if (tld in _TRUSTED_TLDS or (isinstance(tld_val, (int, float)) and tld_val >= 0.02)) else 0.0
+    is_asset   = 1.0 if _ASSET_RE.search(path) else 0.0
 
     return {
         "url_length": float(len(url_s)),
@@ -200,11 +221,19 @@ def _extract_phi_features(url: str) -> dict[str, float]:
         "hyphen_count": float(url_s.count("-")),
         "at_symbol_present": 1.0 if "@" in url_s else 0.0,
         "has_ip_address": 1.0 if _ip_re.match(host) else 0.0,
-        "domain_age_days": np.nan,                  # unknown → neutralized
+
+        # NEW schema features (pure URL-based)
+        "is_asset_url": is_asset,
         "num_subdomains": float(max(host.count(".") - 1, 0)),
-        "num_iframes": np.nan,                      # unknown → neutralized
-        "num_password_inputs": np.nan,              # unknown → neutralized
-        "num_js_redirects": np.nan,                 # unknown → neutralized
+        "is_trusted_tld": is_trusted,
+
+        # Page-only (neutralized if present in order)
+        "num_iframes": np.nan,
+        "num_password_inputs": np.nan,
+        "num_js_redirects": np.nan,
+
+        # Legacy / training-time extras (ignored if not in order)
+        "domain_age_days": np.nan,
         "TLD_freq": tld_val,
     }
 
@@ -413,7 +442,7 @@ def check_endpoint():
         resp, code = _predict_for_url_common(data.get("url"))
         if code != 200:
             return jsonify(resp), code
-        # return just the essentials expected by the extension
+        # essentials expected by the extension
         return jsonify({"ok": True, "url": resp["url"], "label": resp["label"], "score": resp["score"]}), 200
     except Exception as e:
         logging.exception("check error")
