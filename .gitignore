@@ -66,3 +66,7 @@ phishguard_chrome_extension_v2/
 !app/predictions/artifacts/feature_order.json
 !app/predictions/artifacts/threshold.json
 !app/predictions/artifacts/tld_freq.json
+
+app/predictions/artifacts/*.pkl
+
+app/predictions/artifacts/*.jolib
