@@ -1,68 +1,124 @@
+# phishguard/app/predictions/predict.py
 from __future__ import annotations
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import logging
-import os
-import numpy as np
-import threading
+import json, logging, os, pickle, re, threading
+from urllib.parse import urlparse
 
-from . import models as mla  # your module
-from __future__ import annotations
-import os, json, pickle
 import joblib
+import numpy as np
+from flask import Blueprint, jsonify, request
 
-# Where artifacts live by default
-# Directory where model artifacts (trained model, threshold, feature order) are stored
+# -------------------------------------------------
+# Artifact paths (phi model)
+# -------------------------------------------------
 _ART_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
 
-# Path to the trained model file (can be overridden by PHISH_MODEL_PATH environment variable)
-_MODEL_PATH = os.getenv("PHISH_MODEL_PATH", os.path.join(_ART_DIR, "phish_rf.joblib"))
+_MODEL_PATH = os.getenv("PHISH_MODEL_PATH",
+                        os.path.join(_ART_DIR, "rf_phi.pkl"))
+_THRESHOLD_PATH = os.getenv("PHISH_THRESHOLD_PATH",
+                            os.path.join(_ART_DIR, "threshold.json"))
+_FEATURE_ORDER_PATH = os.getenv("PHISH_FEATURE_ORDER_PATH",
+                                os.path.join(_ART_DIR, "feature_order.json"))
+_IMPUTER_PATH = os.getenv("PHISH_IMPUTER_PATH",
+                          os.path.join(_ART_DIR, "imputer_phi.pkl"))
+# Optional: training-time TLD frequency map ({"com":0.42,"net":0.09,...})
+_TLD_FREQ_PATH = os.getenv("PHISH_TLD_FREQ_PATH",
+                           os.path.join(_ART_DIR, "tld_freq.json"))
 
-# Path to the threshold file (can be overridden by PHISH_THRESHOLD_PATH environment variable)
-_THRESHOLD_PATH = os.getenv("PHISH_THRESHOLD_PATH", os.path.join(_ART_DIR, "threshold.json"))
+# Built-in fallback order if feature_order.json is missing
+DEFAULT_PHI_FEATURE_ORDER = [
+    "url_length",
+    "dot_count",
+    "hyphen_count",
+    "at_symbol_present",
+    "has_ip_address",
+    "domain_age_days",
+    "num_subdomains",
+    "num_iframes",
+    "num_password_inputs",
+    "num_js_redirects",
+    "TLD_freq",
+]
 
-# Path to the feature order file (can be overridden by PHISH_FEATURE_ORDER_PATH environment variable)
-_FEATURE_ORDER_PATH = os.getenv("PHISH_FEATURE_ORDER_PATH", os.path.join(_ART_DIR, "feature_order.json"))
+# Neutral fill for missing page-only features when serving URL-only checks
+_NAN_DEFAULT = float(os.getenv("PHISH_NAN_DEFAULT", "0.5"))
+
+# Features we never compute at runtime from a bare URL:
+_NEUTRALIZE_FEATURES = {
+    "domain_age_days",
+    "num_iframes",
+    "num_password_inputs",
+    "num_js_redirects",
+    "TLD_freq",
+}
+
+# De-escalation allowlist by TLD only (HTTPS + non-punycode)
+_ALLOWLIST_TLDS = (".gov", ".edu")
+
+# Registered in app/__init__.py as: from .predictions.predict import bp as ml_bp
+bp = Blueprint("ml", __name__, url_prefix="/api")
+
+# -------------------------------------------------
+# Lazy-loaded artifacts
+# -------------------------------------------------
+_model = None
+_feature_order: list[str] | None = None
+_pos_idx = 1
+_imputer = None
+_tld_freq_map: dict[str, float] | None = None
+_tld_freq_mean: float | None = None
+_lock = threading.Lock()
 
 def _load_artifact(path: str):
-    ext = os.path.splitext(path)[1].lower()
-    if ext in (".joblib", ".jl"):
+    """Try joblib first (works for .pkl/.joblib), then raw pickle."""
+    try:
         return joblib.load(path)
-    # default to pickle (.pkl / .pickle)
+    except Exception:
+        pass
     with open(path, "rb") as f:
         return pickle.load(f)
 
-def load_model():
-    """Return a fitted sklearn estimator or a dict bundle with 'model' and (optionally) 'feature_order'."""
-    # SECURITY: only load from trusted paths!
-    return _load_artifact(_MODEL_PATH)
-
-def load_feature_order():
-    """Return list[str] feature names in serving order, or None if bundled in the model."""
-    try:
-        if os.path.exists(_FEATURE_ORDER_PATH):
+def _load_feature_order() -> list[str]:
+    if os.path.exists(_FEATURE_ORDER_PATH):
+        try:
             with open(_FEATURE_ORDER_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list) and all(isinstance(x, str) for x in data):
                 return data
-    except Exception:
-        pass
-    return None
+        except Exception:
+            logging.exception("feature_order.json read failed; using default")
+    return list(DEFAULT_PHI_FEATURE_ORDER)
 
-def get_threshold(default: float = 0.5) -> float:
-    """Return F1-opt threshold if available; default 0.5 (env PHISH_THRESHOLD overrides)."""
-    # JSON file (preferred)
+def _load_tld_freq():
+    """Load training TLD frequencies if provided; compute a safe mean for unknown TLDs."""
+    global _tld_freq_map, _tld_freq_mean
+    _tld_freq_map, _tld_freq_mean = None, None
+    if not os.path.exists(_TLD_FREQ_PATH):
+        return
+    try:
+        with open(_TLD_FREQ_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data:
+            _tld_freq_map = {str(k).lower(): float(v) for k, v in data.items()}
+            vals = [v for v in _tld_freq_map.values() if np.isfinite(v)]
+            if vals:
+                _tld_freq_mean = float(np.mean(vals))
+    except Exception:
+        logging.exception("tld_freq.json read failed; ignoring")
+
+def _get_threshold(default: float = 0.85) -> float:
+    """From file (threshold/f1_opt) or env PHISH_THRESHOLD, else default."""
     try:
         if os.path.exists(_THRESHOLD_PATH):
             with open(_THRESHOLD_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            t = float(data.get("f1_opt", default))
-            if 0.0 <= t <= 1.0:
-                return t
+            for k in ("threshold", "f1_opt"):
+                if k in data:
+                    t = float(data[k])
+                    if 0.0 <= t <= 1.0:
+                        return t
     except Exception:
         pass
-    # ENV override
     try:
         t_env = float(os.getenv("PHISH_THRESHOLD", default))
         if 0.0 <= t_env <= 1.0:
@@ -71,248 +127,189 @@ def get_threshold(default: float = 0.5) -> float:
         pass
     return default
 
-
-# -------------------------------------------------
-# Flask setup
-# -------------------------------------------------
-app = Flask(__name__)
-CORS(app)
-logging.basicConfig(level=logging.INFO)
-
-# -------------------------------------------------
-# Global, lazy-loaded artifacts (no training here)
-# -------------------------------------------------
-# Global variables for lazy-loaded model artifacts
-_model = None                # The trained model instance (loaded once)
-_feature_order = None        # List of feature names in model order
-_pos_idx = 1                 # Default positive class index; will be inferred from model
-_label_map = {0: "legit", 1: "phish"}  # Maps model output to labels; adjust if using string labels
-_lock = threading.Lock()     # Thread lock for safe lazy loading
-
-def _try_getattr(obj, names):
-    """
-    Return the first existing attribute from a list of possible names, or None if not found.
-    Used to flexibly access loader functions or properties in the MLA module.
-    """
-    for n in names:
-        if hasattr(obj, n):
-            return getattr(obj, n)
-    return None
-
-def _load_feature_order():
-    """
-    Try several conventional functions in your mla module to load feature order.
-    Adjust the candidate names if your module differs.
-
-    Returns:
-        list[str] | None: The feature order as a list of strings, or None if not found.
-    """
-    # Try to get a loader function or property from the MLA module
-    loader = _try_getattr(mla, [
-        "load_feature_order",          # Preferred: explicit loader
-        "get_feature_order",           # Alternative: getter
-        "feature_order",               # Alternative: direct property
-    ])
-    if callable(loader):
-        fo = loader()
-        # Ensure the returned value is a list/tuple of strings
-        if isinstance(fo, (list, tuple)) and all(isinstance(x, str) for x in fo):
-            return list(fo)
-    # Fallback: if your model bundle carries the order, leave None here; we’ll infer later.
-    return None
-
-def _load_model_bundle():
-    """
-    Loads the trained model and feature order from the Core_Machine_Learning_Algorithm module.
-    Tries several conventional loader function names. Returns:
-        (model, feature_order, pos_label)
-    """
-    # Try common loader names in Core_Machine_Learning_Algorithm
-    load_fn = _try_getattr(mla, [
-        "load_model",                  # ideal: returns fitted model (and maybe metadata)
-        "load_rf",                     # if you saved a specific RF
-        "restore_model",               # alternative loader name
-        "get_trained_model",           # another possible loader name
-    ])
-
-    if callable(load_fn):
-        bundle = load_fn()
-        # Accept either raw estimator or dict bundle
-        if isinstance(bundle, dict):
-            # If loader returns a dict, extract model, feature order, and positive label
-            model = bundle.get("model", None)
-            fo = bundle.get("feature_order", None) or _load_feature_order()
-            pos_label = bundle.get("pos_label", 1)
-            return model, fo, pos_label
-        else:
-            # If loader returns just the model, infer feature order and use default pos_label
-            return bundle, _load_feature_order(), 1
-
-    # LAST RESORT: fallback to training if no loader is found
-    # Only use this if train_rf() returns a fitted model without retraining
-    train_fn = _try_getattr(mla, ["train_rf"])
-    if callable(train_fn):
-        logging.warning("No explicit load_model() found; using train_rf() as a fallback loader.")
-        model = train_fn()
-        return model, _load_feature_order(), 1
-
-    # If no loader or trainer is found, raise an error
-    raise RuntimeError("No model loader found in Core_Machine_Learning_Algorithm.")
-
-def _infer_positive_index(model):
-    """
-    Determine which column of predict_proba corresponds to the phishing class.
-    We assume '1' => phish as a convention; if your classes_ are strings, we look for 'phish'.
-    Otherwise we fall back to the last column.
-    """
-    pos_idx = 1  # Default to index 1 (second column)
-    classes = getattr(model, "classes_", None)  # Try to get model's class labels
-
+def _infer_positive_index(model) -> int:
+    """Find which predict_proba column is positive class."""
+    pos = 1
+    classes = getattr(model, "classes_", None)
     if classes is None:
-        # If model does not have classes_, return default
-        return pos_idx
-
-    # numpy array or list
+        return pos
     try:
         if 1 in classes:
-            # Standard case: classes are [0, 1], with 1 = phishing
-            pos_idx = int(np.where(classes == 1)[0][0])
-        elif "phish" in classes:
-            # If classes are string labels, look for "phish"
-            pos_idx = int(np.where(classes == "phish")[0][0])
-        else:
-            # Fallback: use last column
-            pos_idx = len(classes) - 1
+            return int(np.where(classes == 1)[0][0])
+        if "phish" in classes:
+            return int(np.where(classes == "phish")[0][0])
+        return len(classes) - 1
     except Exception:
-        # If any error, fallback to index 1 if possible, else 0
-        pos_idx = 1 if len(classes) > 1 else 0
-
-    return pos_idx
-
-def _label_from_score(score: float, threshold: float) -> str:
-    """
-    Returns the label ("phish" or "legit") based on the score and threshold.
-
-    Args:
-        score (float): The predicted probability for the positive class.
-        threshold (float): The decision threshold.
-
-    Returns:
-        str: "phish" if score >= threshold, else "legit".
-    """
-    return "phish" if score >= threshold else "legit"
-
-def _threshold():
-    """
-    Optional: pull an F1-optimal threshold from your module or env var.
-    Defaults to 0.5 if not set.
-    """
-    # Try to get threshold from the MLA module (e.g., get_threshold or load_threshold)
-    get_thr = _try_getattr(mla, ["get_threshold", "load_threshold"])
-    if callable(get_thr):
-        try:
-            t = float(get_thr())
-            if 0.0 <= t <= 1.0:
-                return t  # Use threshold from MLA module if valid
-        except Exception:
-            pass  # Ignore errors and continue
-
-    # Try to get threshold from environment variable PHISH_THRESHOLD
-    t_env = os.getenv("PHISH_THRESHOLD", "")
-    try:
-        t = float(t_env)
-        if 0.0 <= t <= 1.0:
-            return t  # Use threshold from environment if valid
-    except Exception:
-        pass  # Ignore errors and continue
-
-    # Default threshold if none found
-    return 0.5
+        return 1 if len(classes) > 1 else 0
 
 def _ensure_loaded():
-    """
-    Lazy-load model, feature order, and positive class index once, thread-safe.
-
-    Ensures that the model and its metadata are loaded only once, even if multiple
-    threads access the API simultaneously. Uses a thread lock for safety.
-    """
-    global _model, _feature_order, _pos_idx
+    """Load model + artifacts once."""
+    global _model, _feature_order, _pos_idx, _imputer
     if _model is not None:
-        # Already loaded, nothing to do
         return
     with _lock:
         if _model is not None:
-            # Double-checked locking: another thread may have loaded it
             return
-        # Load model, feature order, and positive label index from the MLA module
-        model, fo, pos_label = _load_model_bundle()
-        if model is None:
-            # If loading failed, raise an error
-            raise RuntimeError("Model failed to load.")
-        _model = model
-        _feature_order = fo
-        # If pos_label is None, infer positive index from model; otherwise, use pos_label
-        _pos_idx = _infer_positive_index(_model) if pos_label is None else _infer_positive_index(_model)
+        if not os.path.exists(_MODEL_PATH):
+            raise FileNotFoundError(f"Model not found at {_MODEL_PATH}")
+        _model = _load_artifact(_MODEL_PATH)
+        _feature_order = _load_feature_order()
+        _pos_idx = _infer_positive_index(_model)
+        _imputer = None
+        if os.path.exists(_IMPUTER_PATH):
+            try:
+                _imputer = _load_artifact(_IMPUTER_PATH)
+            except Exception:
+                logging.exception("Imputer load failed; continuing without it")
+        _load_tld_freq()
 
 # -------------------------------------------------
-# Helpers
+# Runtime feature extraction (phi)
 # -------------------------------------------------
-def _vector_from_payload(features, feature_order):
-    """
-    Converts input features (dict or list) into a 2D numpy array for model prediction.
+_ip_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 
-    Args:
-        features (dict or list): Feature values, either as a dict {name: value} or a list [v1, v2, ...].
-        feature_order (list[str]): List of feature names in model order (required for dict input).
+def _naive_etld1(host: str) -> str:
+    parts = [p for p in (host or "").split(".") if p]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (host or "")
 
-    Returns:
-        np.ndarray: Array of shape (1, n_features) suitable for model input.
+def _extract_phi_features(url: str) -> dict[str, float]:
+    u = url.strip()
+    if not re.match(r"^[a-zA-Z]+://", u):
+        u = "http://" + u
+    parsed = urlparse(u)
+    host = (parsed.hostname or "").lower()
+    url_s = u
 
-    Raises:
-        ValueError: If feature order is unknown for dict input, or list length mismatches feature order.
-        TypeError: If features is not a dict or list.
-    """
-    if isinstance(features, dict):
-        # Map dict values to model order; missing keys default to 0
-        if not feature_order:
-            raise ValueError("Feature order is unknown; cannot map dict to vector.")
-        vec = [features.get(k, 0) for k in feature_order]
-        return np.asarray(vec, dtype=float).reshape(1, -1)
-
-    if isinstance(features, list):
-        # If feature order is known, check length matches
-        if feature_order and len(features) != len(feature_order):
-            raise ValueError(f"Expected {len(feature_order)} features, got {len(features)}.")
-        return np.asarray(features, dtype=float).reshape(1, -1)
-
-    # Invalid input type
-    raise TypeError("'features' must be a list or a dict of name->value.")
-
-# -------------------------------------------------
-# Routes
-# -------------------------------------------------
-# -------------------------------------------------
-# Health check endpoint
-# -------------------------------------------------
-@app.route("/health", methods=["GET"])
-def health():
-    """
-    GET /health
-
-    Returns basic health and model status info.
-    Checks if the model is loaded and returns metadata.
-
-    Response:
-    {
-        "ok": True,
-        "model_loaded": True,
-        "n_features_in": <number of input features>,
-        "classes": <model class labels>,
-        "feature_order_known": True|False
-    }
-    """
+    # Best-effort TLD
+    tld = ""
     try:
-        _ensure_loaded()  # Make sure model is loaded
+        parts = host.split(".")
+        tld = parts[-1] if len(parts) >= 2 else ""
+    except Exception:
+        tld = ""
+
+    # TLD_freq: use training map if present, else mean, else NaN (let neutralizer handle)
+    if _tld_freq_map:
+        tld_val = _tld_freq_map.get(tld, _tld_freq_mean if _tld_freq_mean is not None else np.nan)
+    else:
+        tld_val = np.nan
+
+    return {
+        "url_length": float(len(url_s)),
+        "dot_count": float(url_s.count(".")),
+        "hyphen_count": float(url_s.count("-")),
+        "at_symbol_present": 1.0 if "@" in url_s else 0.0,
+        "has_ip_address": 1.0 if _ip_re.match(host) else 0.0,
+        "domain_age_days": np.nan,                  # unknown → neutralized
+        "num_subdomains": float(max(host.count(".") - 1, 0)),
+        "num_iframes": np.nan,                      # unknown → neutralized
+        "num_password_inputs": np.nan,              # unknown → neutralized
+        "num_js_redirects": np.nan,                 # unknown → neutralized
+        "TLD_freq": tld_val,
+    }
+
+def _dict_to_vector(d: dict[str, float]) -> np.ndarray:
+    """Neutralize page-only NaNs before imputer, to avoid 'missing == phish' bias."""
+    _ensure_loaded()
+    row = []
+    for k in _feature_order:
+        v = d.get(k, np.nan)
+        if k in _NEUTRALIZE_FEATURES:
+            try:
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    v = _NAN_DEFAULT
+            except Exception:
+                v = _NAN_DEFAULT
+        row.append(v)
+
+    vec = np.asarray([row], dtype=float)
+
+    if _imputer is not None:
+        try:
+            vec = _imputer.transform(vec)  # only imputes remaining NaNs
+        except Exception:
+            logging.exception("imputer.transform failed; NaN->neutral fallback")
+            vec = np.nan_to_num(vec, nan=_NAN_DEFAULT)
+    else:
+        vec = np.nan_to_num(vec, nan=_NAN_DEFAULT)
+
+    return vec
+
+def _clamp_score(x: float) -> float:
+    """Guard against NaN/inf/out-of-range probabilities."""
+    try:
+        if not np.isfinite(x):
+            return 0.5
+        return float(max(0.0, min(1.0, x)))
+    except Exception:
+        return 0.5
+
+# -------------------------
+# Rule-based post-processor
+# -------------------------
+def _postprocess_score(url: str, base_score: float) -> tuple[float, dict]:
+    """
+    Lightweight guardrails:
+      - De-escalate HTTPS + .gov/.edu (non-punycode).
+      - Escalate IP-host + login-ish paths.
+    Returns (adjusted_score, debug_info).
+    """
+    info = {
+        "gov_edu_deescalated": False,
+        "ip_login_bump_applied": False,
+        "etld1": None,
+        "host": None,
+        "scheme": None,
+        "path": None,
+    }
+
+    try:
+        parsed = urlparse(url if re.match(r"^[a-zA-Z]+://", url) else "http://" + url)
+        host = (parsed.hostname or "").lower()
+        scheme = parsed.scheme.lower()
+        path = (parsed.path or "").lower()
+        etld1 = _naive_etld1(host)
+
+        info.update({"host": host, "scheme": scheme, "path": path, "etld1": etld1})
+
+        score = _clamp_score(base_score)
+
+        # Escalate: IP host + login-ish keyword in path
+        if _ip_re.match(host) and any(k in path for k in ("login", "signin", "verify", "password", "account", "update")):
+            score = max(score, 0.96)
+            info["ip_login_bump_applied"] = True
+
+        # De-escalate: HTTPS .gov/.edu, non-punycode
+        if scheme == "https" and "xn--" not in host and host.endswith(_ALLOWLIST_TLDS):
+            score = min(score, 0.15)
+            info["gov_edu_deescalated"] = True
+
+        return _clamp_score(score), info
+    except Exception:
+        return _clamp_score(base_score), info
+
+# -------------------------------------------------
+# Public helpers
+# -------------------------------------------------
+def score_url(url: str) -> float:
+    _ensure_loaded()
+    X = _dict_to_vector(_extract_phi_features(url))
+    proba = _model.predict_proba(X)
+    base = float(proba[0, _pos_idx] if proba.shape[1] > 1 else proba[0, 0])
+    base = _clamp_score(base)
+    adjusted, _ = _postprocess_score(url, base)
+    return adjusted
+
+def label_url(url: str) -> str:
+    return "phish" if score_url(url) >= _get_threshold() else "legit"
+
+# -------------------------------------------------
+# Routes (mounted under /api via blueprint)
+# -------------------------------------------------
+@bp.get("/health")
+def health():
+    try:
+        _ensure_loaded()
         classes = getattr(_model, "classes_", None)
         return jsonify({
             "ok": True,
@@ -320,104 +317,143 @@ def health():
             "n_features_in": getattr(_model, "n_features_in_", None),
             "classes": classes.tolist() if hasattr(classes, "tolist") else classes,
             "feature_order_known": _feature_order is not None,
+            "threshold": _get_threshold(),
+            "tld_freq_loaded": bool(_tld_freq_map),
+            "imputer_loaded": bool(_imputer is not None),
+            "nan_default": _NAN_DEFAULT,
+            "allowlist_tlds": list(_ALLOWLIST_TLDS),
         }), 200
     except Exception as e:
-        logging.exception("Health check failed")
+        logging.exception("health failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# -------------------------------------------------
-# Feature order endpoint
-# -------------------------------------------------
-@app.route("/feature_order", methods=["GET"])
-def feature_order_endpoint():
-    """
-    GET /feature_order
-
-    Returns the feature order used by the model.
-
-    Response:
-    {
-        "ok": True,
-        "feature_order": [list of feature names],
-        "count": <number of features>
-    }
-    """
-    try:
-        _ensure_loaded()  # Make sure model is loaded
-        return jsonify({
-            "ok": True,
-            "feature_order": _feature_order or [],
-            "count": len(_feature_order) if _feature_order else 0
-        }), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/predict", methods=["POST"])
+@bp.post("/predict")
 def predict():
-    """
-    POST /predict
-
-    Request Body:
-    {
-      "features": {name: value, ...}   # preferred (dict)
-      # or
-      "features": [v1, v2, ...]        # list in model order
-    }
-
-    Response:
-    {
-      "ok": true,
-      "label": "phish"|"legit",
-      "score": 0.8734,                 # P(phish)
-      "threshold": 0.57,
-      "positive_class_index": 1,
-      "features_checked": 24
-    }
-    """
+    """Predict from a provided feature dict/list (mostly for internal testing)."""
     try:
-        _ensure_loaded()  # Ensure model and metadata are loaded
+        _ensure_loaded()
+        data = request.get_json(force=True) or {}
+        feats = data.get("features")
+        if feats is None:
+            return jsonify({"ok": False, "error": "Missing 'features'"}), 400
 
-        # Parse JSON body from request
-        data = request.get_json(force=True, silent=False)
-        if not data or "features" not in data:
-            # Missing features in request
-            return jsonify({"ok": False, "error": "Missing 'features' in JSON body."}), 400
-
-        # Convert input features to numpy array in model order
-        X = _vector_from_payload(data["features"], _feature_order)
-        if not hasattr(_model, "predict_proba"):
-            # Model does not support probability prediction
-            return jsonify({"ok": False, "error": "Model has no predict_proba()."}), 500
-
-        # Get probability predictions from model
-        proba = _model.predict_proba(X)
-        if proba.shape[1] == 1:
-            # Some models output a single probability column
-            score = float(proba[0, 0])
+        if isinstance(feats, dict):
+            X = _dict_to_vector(feats)
+        elif isinstance(feats, list):
+            if _feature_order and len(feats) != len(_feature_order):
+                return jsonify({"ok": False, "error": f"Expected {len(_feature_order)} features, got {len(feats)}"}), 400
+            X = np.asarray([feats], dtype=float)
+            if _imputer is not None:
+                try:
+                    X = _imputer.transform(X)
+                except Exception:
+                    logging.exception("imputer.transform failed; NaN->neutral fallback")
+                    X = np.nan_to_num(X, nan=_NAN_DEFAULT)
+            else:
+                X = np.nan_to_num(X, nan=_NAN_DEFAULT)
         else:
-            # Use the positive class index for phishing probability
-            score = float(proba[0, _pos_idx])
+            return jsonify({"ok": False, "error": "'features' must be dict or list"}), 400
 
-        thr = _threshold()  # Get decision threshold
-        label = _label_from_score(score, thr)  # Map score to label
+        if not hasattr(_model, "predict_proba"):
+            return jsonify({"ok": False, "error": "Model has no predict_proba()"}), 500
 
-        logging.info(f"Predicted label={label}, score={score:.4f}")
-        # Return prediction result
+        proba = _model.predict_proba(X)
+        base = float(proba[0, _pos_idx] if proba.shape[1] > 1 else proba[0, 0])
+        base = _clamp_score(base)
+        thr = _get_threshold()
+        label = "phish" if base >= thr else "legit"
         return jsonify({
-            "ok": True,
-            "label": label,
-            "score": round(score, 6),
-            "threshold": thr,
-            "positive_class_index": _pos_idx,
+            "ok": True, "label": label, "score": round(base, 6),
+            "threshold": thr, "positive_class_index": _pos_idx,
             "features_checked": int(X.shape[1]),
         }), 200
-
     except Exception as e:
-        # Log and return error details
-        logging.exception("Prediction error")
+        logging.exception("predict error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+def _predict_for_url_common(url: str):
+    """Shared code for /predict_url and /check."""
+    _ensure_loaded()
+    url = (url or "").strip()
+    if not url:
+        return {"ok": False, "error": "Missing 'url'"}, 400
+    X = _dict_to_vector(_extract_phi_features(url))
+    proba = _model.predict_proba(X)
+    base = float(proba[0, _pos_idx] if proba.shape[1] > 1 else proba[0, 0])
+    base = _clamp_score(base)
+    score, post_dbg = _postprocess_score(url, base)
+    thr = _get_threshold()
+    label = "phish" if score >= thr else "legit"
+    return {
+        "ok": True,
+        "url": url,
+        "label": label,
+        "score": round(_clamp_score(score), 6),
+        "base_score": round(base, 6),
+        "threshold": thr,
+        "postprocess": post_dbg,
+    }, 200
 
-if __name__ == "__main__":
-    # Never enable debug=True in production
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+@bp.post("/predict_url")
+def predict_url_endpoint():
+    try:
+        data = request.get_json(force=True) or {}
+        resp, code = _predict_for_url_common(data.get("url"))
+        return jsonify(resp), code
+    except Exception as e:
+        logging.exception("predict_url error")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# === Extension-compatible ===
+@bp.post("/check")
+def check_endpoint():
+    """Extension uses POST /api/check with {url} → {label, score, url}."""
+    try:
+        data = request.get_json(force=True) or {}
+        resp, code = _predict_for_url_common(data.get("url"))
+        if code != 200:
+            return jsonify(resp), code
+        # return just the essentials expected by the extension
+        return jsonify({"ok": True, "url": resp["url"], "label": resp["label"], "score": resp["score"]}), 200
+    except Exception as e:
+        logging.exception("check error")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@bp.get("/debug_check")
+def debug_check():
+    """
+    Diagnostic: shows the raw feature dict, imputed vector, and scores (base + post-processed).
+    """
+    try:
+        _ensure_loaded()
+        url = (request.args.get("url") or "").strip()
+        feats = _extract_phi_features(url) if url else {}
+        X = _dict_to_vector(feats) if url else np.zeros((1, len(_feature_order or [])))
+
+        base = None
+        score = None
+        post_dbg = None
+        if url:
+            proba = _model.predict_proba(X)
+            base = float(proba[0, _pos_idx] if proba.shape[1] > 1 else proba[0, 0])
+            base = _clamp_score(base)
+            score, post_dbg = _postprocess_score(url, base)
+
+        return jsonify({
+            "ok": True,
+            "url": url,
+            "feature_order": _feature_order,
+            "features_raw": feats,
+            "vector_after_impute": list(map(float, X.ravel())),
+            "threshold": _get_threshold(),
+            "pos_idx": _pos_idx,
+            "nan_default": _NAN_DEFAULT,
+            "imputer_loaded": bool(_imputer is not None),
+            "tld_freq_loaded": bool(_tld_freq_map),
+            "base_score": base,
+            "score_after_rules": score,
+            "postprocess": post_dbg,
+        }), 200
+    except Exception as e:
+        logging.exception("debug_check failed")
+        return jsonify({"ok": False, "error": str(e)}), 500

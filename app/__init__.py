@@ -9,6 +9,8 @@ from .extensions import db, login_manager, mail, migrate, jwt
 from .auth.routes import auth_bp
 from .main.routes import main_bp
 from .api.routes import api_bp  # our API blueprint
+from .predictions.predict import bp as ml_bp  # <-- NEW: ML endpoints (/api/health, /api/predict*) (NEW) 
+
 
 def create_app():
     # Load .env from project root (for local dev)
@@ -30,6 +32,8 @@ def create_app():
         MAIL_USERNAME=os.getenv("MAIL_USERNAME"),
         MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),
         MAIL_DEFAULT_SENDER=os.getenv("MAIL_DEFAULT_SENDER", "noreply@example.com"),
+        MAIL_SUPPRESS_SEND=os.getenv("MAIL_SUPPRESS_SEND", "false").lower() in ("1","true","yes"), #  ADDED TESTING
+
 
         # Token salts
         SECURITY_EMAIL_SALT=os.getenv("SECURITY_EMAIL_SALT", "email-confirm-salt"),
@@ -67,5 +71,7 @@ def create_app():
     app.register_blueprint(auth_bp)
     app.register_blueprint(main_bp)
     app.register_blueprint(api_bp)  # routes.py already has url_prefix="/api"
+    app.register_blueprint(ml_bp)
+
 
     return app
