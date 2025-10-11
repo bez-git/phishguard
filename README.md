@@ -1,4 +1,8 @@
 ﻿PhishGuard
+
+Files to Extension : 
+https://drive.google.com/drive/folders/1yR-pS1MigUfD7Lxv-qdisMeh9a8LW1GN?usp=drive_link
+
 Flask API + Chrome MV3 extension for real-time phishing risk detection.
 The extension sends page/link URLs; the API serves a trained model and returns a label + score.
 
