@@ -1,35 +1,82 @@
+# app/auth/routes.py
 from datetime import datetime
+import re
+
 from flask import Blueprint, render_template, redirect, url_for, flash, request
 from flask_login import login_user, logout_user, login_required, current_user
+from sqlalchemy.exc import IntegrityError
+
 from ..extensions import db
-from ..predictions.models import User
+from app.models import User
 from .forms import RegisterForm, LoginForm, RequestResetForm, ResetPasswordForm
 from ..email_utils import generate_token, verify_token, send_email
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
+
+def _generate_username_from_email(email: str) -> str:
+    """
+    Make a safe, unique username from the email local-part.
+    - lowercases
+    - keeps letters, digits, underscore
+    - if taken, appends a number: john, john2, john3, ...
+    """
+    base = (email.split("@", 1)[0]).lower()
+    base = re.sub(r"[^a-z0-9_]+", "", base) or "user"
+
+    candidate = base
+    i = 1
+    # Loop until we find a free candidate
+    while User.query.filter_by(username=candidate).first() is not None:
+        i += 1
+        candidate = f"{base}{i}"
+    return candidate
+
+
 @auth_bp.route("/register", methods=["GET", "POST"])
 def register():
     if current_user.is_authenticated:
         return redirect(url_for("main.index"))
+
     form = RegisterForm()
     if form.validate_on_submit():
         email = form.email.data.lower().strip()
+
+        # Block duplicates by email up front
         if User.query.filter_by(email=email).first():
             flash("An account with that email already exists.", "warning")
             return redirect(url_for("auth.login"))
-        user = User(email=email)
+
+        username = _generate_username_from_email(email)
+
+        user = User(username=username, email=email)
         user.set_password(form.password.data)
         db.session.add(user)
-        db.session.commit()
 
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # In the unlikely event of a race on username, try once more.
+            db.session.rollback()
+            username = _generate_username_from_email(email)
+            user.username = username
+            db.session.add(user)
+            db.session.commit()
+
+        # Email confirmation (works even if MAIL_SUPPRESS_SEND=true)
         token = generate_token(user.email, "confirm")
         confirm_url = url_for("auth.confirm_email", token=token, _external=True)
-        send_email("Confirm your PhishGuard account", [user.email],
-                   "emails/confirm.html", confirm_url=confirm_url)
+        send_email(
+            "Confirm your PhishGuard account",
+            [user.email],
+            "emails/confirm.html",
+            confirm_url=confirm_url,
+        )
         flash("Account created! Check your inbox for a confirmation link.", "success")
         return redirect(url_for("auth.login"))
+
     return render_template("auth/register.html", form=form)
+
 
 @auth_bp.route("/confirm/<token>")
 def confirm_email(token):
@@ -37,14 +84,21 @@ def confirm_email(token):
     if not email:
         flash("Confirmation link is invalid or expired.", "danger")
         return redirect(url_for("auth.resend_confirmation"))
+
     user = User.query.filter_by(email=email).first_or_404()
-    if user.is_confirmed:
+    if getattr(user, "is_confirmed", False) or getattr(user, "email_confirmed_at", None):
         flash("Email already confirmed. Please log in.", "info")
     else:
-        user.email_confirmed_at = datetime.utcnow()
+        # support either boolean flag or timestamp field depending on your model
+        if hasattr(user, "email_confirmed_at"):
+            user.email_confirmed_at = datetime.utcnow()
+        if hasattr(user, "is_confirmed"):
+            user.is_confirmed = True
         db.session.commit()
         flash("Your email has been confirmed!", "success")
     return redirect(url_for("auth.login"))
+
+# (rest of the file — login/logout/reset — unchanged)
 
 @auth_bp.route("/resend-confirmation")
 def resend_confirmation():
