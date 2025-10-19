@@ -1,84 +1,163 @@
 ﻿PhishGuard
 
-Files to Extension : 
-https://drive.google.com/drive/folders/1yR-pS1MigUfD7Lxv-qdisMeh9a8LW1GN?usp=drive_link
-
 Flask API + Chrome MV3 extension for real-time phishing risk detection.
 The extension sends page/link URLs; the API serves a trained model and returns a label + score.
 
 
-
-Status (Oct 2025)
-Backend: Flask (app factory + JWT auth).
-Model serving: phish_rf.joblib + imputer_phi.joblib (via Git LFS), feature_order.json (12 features), optional tld_freq.json.
-Safe NaN handling + light post-processing (IP+login bump; HTTPS .gov/.edu de-escalation).
-Data: /api/report stores { url, score, label, evaluated_at }.
-Extension (MV3): Auto-check on tab activate/complete, badge, link auto-scan & cache, notifications, popup with login & Scan Page.
-Deploy: Render (web + Postgres). Git LFS required for model binaries.
-
-
-
-API (quick)
-Auth
-POST /api/login → { access_token, refresh_token }
-POST /api/refresh → { access_token }
-GET /api/me → current user (Bearer)
-
-Scoring
-POST /api/check → { ok, url, label, score, threshold }
-GET /api/debug_check?url=... → features + imputed vector + scores
-GET /api/health → model/threshold + diagnostics
-
-Reports
-POST /api/report, GET /api/reports (auth)
+Files for the Extension
+Google Drive (packaged assets):
+https://drive.google.com/drive/folders/1yR-pS1MigUfD7Lxv-qdisMeh9a8LW1GN?usp=drive_link
 
 
 
 
-How to quick Start 
-# Create venv & install
+
+
+
+
+
+
+What’s inside
+Backend: Flask (app factory), JWT auth, Alembic/Flask-Migrate, SQLAlchemy (Postgres/SQLite)
+Model serving: phish_rf.joblib + imputer_phi.joblib (tracked with Git LFS)
+Features: 12 features w/ NaN-safe imputation, HTTPS/TLD heuristics
+Data: /api/report persists reports for the dashboard
+Dashboard: Revamped templates/base.html, templates/dashboard.html, and templates/index.html
+Deploy: Render (Web Service + Postgres). Portable Git-LFS during build.
+
+
+
+Quick start (Windows, PowerShell)
+# 1) Clone & enter
+git clone https://github.com/<your-username>/phishguard.git
+cd phishguard
+
+# 2) Create venv & install deps
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-# .env (minimal)
-FLASK_ENV=development
-FLASK_DEBUG=1
-SECRET_KEY=change-me
-JWT_SECRET_KEY=change-me-too
-SQLALCHEMY_DATABASE_URI=sqlite:///phishguard.sqlite3
-PHISH_THRESHOLD=0.90
-PHISH_NAN_DEFAULT=0.5
+# 3) (First time) pull model artifacts via Git LFS
+git lfs install
+git lfs pull
 
-# DB + run
+# 4) Create .env (see below), then initialize DB
+python -m flask --app wsgi.py db upgrade
+
+# 5) Run the API (dev)
+python -m flask --app wsgi.py run --debug --port 5000
+
+
+
+
+Alternative run command (same result):
 $env:FLASK_APP="wsgi.py"
-flask db upgrade
 flask run --reload --port 5000
 
 
 
-Extension (dev)
-chrome://extensions → enable Developer mode → Load unpacked → phishguard_chrome_extension_v2/
+.env (minimal for local dev)
+# Flask
+FLASK_ENV=development
+FLASK_DEBUG=1
+SECRET_KEY=change-me
+
+# Database (SQLite for local)
+SQLALCHEMY_DATABASE_URI=sqlite:///phishguard.sqlite3
+
+# Model behavior
+PHISH_THRESHOLD=0.90
+PHISH_NAN_DEFAULT=0.5
+
+# JWT for /api
+JWT_SECRET_KEY=change-me-too
+
+# Email (Mailtrap or disable)
+MAIL_SERVER=live.smtp.mailtrap.io
+MAIL_PORT=2525
+MAIL_USE_TLS=true
+MAIL_USERNAME=smtp@mailtrap.io
+MAIL_PASSWORD=<your-mailtrap-password>
+MAIL_DEFAULT_SENDER="PhishGuard <noreply@phishguard.shop>"
+MAIL_SUPPRESS_SEND=false
+
+# Tokens for email flows
+SECURITY_EMAIL_SALT=confirm-salt-CHANGE-ME
+SECURITY_RESET_SALT=reset-salt-CHANGE-ME
+TOKEN_MAX_AGE=86400
+
+
+
+Chrome Extension (dev)
+Open chrome://extensions, enable Developer mode.
+Load unpacked → select phishguard_chrome_extension_v2/.
 Edit phishguard_chrome_extension_v2/config.js:
+// For local dev:
 const CONFIG = { API_BASE: "http://127.0.0.1:5000" };
-Open the popup → Log in → Scan this page.
+// For prod:
+// const CONFIG = { API_BASE: "https://www.phishguard.shop" };
+Open the popup → Log in → “Scan this page”.
 
 
 
-Deploy (Render)
-Git LFS: repo tracks .joblib artifacts via LFS.
-Build command
+REST API (quick)
+Auth
+POST /api/login → { access_token, refresh_token }
+POST /api/refresh → { access_token }
+GET /api/me (Bearer)
+
+
+Scoring
+POST /api/check → { url, label, score }
+GET /api/health → model/meta diagnostics
+
+Reports
+POST /api/report (persist one)
+GET /api/reports?limit=50
+
+
+
+Deploy on Render
+Build Command
 bash scripts/render-build.sh
-(Downloads portable git-lfs during build, runs git lfs pull, then pip install -r requirements.txt.)
-Start command
-FLASK_APP=wsgi.py flask db upgrade && \
-gunicorn -w 1 -k gthread --threads 4 --timeout 120 -b 0.0.0.0:$PORT wsgi:app
-1 worker keeps memory sane; threads share the same model.
-Python version: runtime.txt → python-3.12.5
-Env vars (prod): SECRET_KEY, JWT_SECRET_KEY, DATABASE_URL (Postgres), optional PHISH_THRESHOLD (prod currently 0.85), PHISH_NAN_DEFAULT=0.5.
-Health check: GET /api/health should show n_features_in: 12 and your threshold.
+(Downloads portable Git-LFS, runs git lfs pull, then pip install -r requirements.txt.)
+Start Command
+PYTHONPATH=. FLASK_APP=wsgi.py python -m flask db upgrade && \
+python -m gunicorn --preload -w 1 -k gthread --threads 4 --timeout 120 -b 0.0.0.0:$PORT wsgi:app
 
 
-Troubleshooting
-Extension says “Failed to fetch” → check CORS, service status, and /api/health.
-502 / OOM → ensure 1 gunicorn worker; instance with sufficient RAM (model ~160 MB + app).
+
+Key environment variables (prod)
+SECRET_KEY
+JWT_SECRET_KEY
+SQLALCHEMY_DATABASE_URI (Postgres), e.g.
+postgresql+psycopg://<user>:<pass>@<host>/<db>?sslmode=require
+MAIL_* (if you want registration/reset emails)
+SECURITY_EMAIL_SALT, SECURITY_RESET_SALT, TOKEN_MAX_AGE
+PHISH_THRESHOLD (prod default is often 0.85)
+PHISH_NAN_DEFAULT=0.5
+
+
+Models not loading → ensure git lfs pull fetched .joblib files.
+DB URL errors → use the postgresql+psycopg:// driver prefix.
+Migration errors → run python -m flask --app wsgi.py db upgrade.
+Emails fail → confirm MAIL_* settings and Mailtrap domain verification; set MAIL_SUPPRESS_SEND=true to disable sending in dev.
+
+
+
+Changelog (Oct 2025)
+Revamped UI templates: base.html, dashboard.html, index.html
+Hardened email flows (confirmation + reset) using salts and timed tokens
+Widened users.password_hash to 255 (Alembic migration)
+Render build now uses portable Git-LFS; Start command runs DB migrations automatically
+
+
+Commit & push to GitHub
+# From repo root
+git add -A
+git commit -m "docs: update README with local run steps and deploy notes"
+git push origin main.
+
+
+License
+MIT (see LICENSE)
