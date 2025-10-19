@@ -7,26 +7,25 @@ python -V || true
 which pip || true
 pip -V || true
 
-# Install Git LFS in Render build env
-if ! command -v git-lfs >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y --no-install-recommends git-lfs
-fi
+# --- Install a portable git-lfs (no apt-get needed) ---
+LFS_VER="3.5.1"
+URL="https://github.com/git-lfs/git-lfs/releases/download/v${LFS_VER}/git-lfs-linux-amd64-v${LFS_VER}.tar.gz"
+curl -fsSL "$URL" -o /tmp/gitlfs.tgz
 
+mkdir -p /tmp/git-lfs
+tar -xzf /tmp/gitlfs.tgz -C /tmp/git-lfs
+# find the unpacked binary and put it on PATH
+LFS_DIR="$(dirname "$(find /tmp/git-lfs -type f -name git-lfs -print -quit)")"
+export PATH="$LFS_DIR:$PATH"
+git-lfs version
+
+# Ensure filters/hooks are active and pull all LFS objects
 git lfs install
-# force a real fetch of all LFS artifacts (model files)
 git lfs pull --exclude="" --include=""
+git lfs ls-files || true
 
-# Install deps into Render’s venv (pip already points to it)
-pip install --upgrade pip
-pip install -r requirements.txt
-
-echo "=== Verify Flask is installed into this python ==="
-python - <<'PY'
-import sys
-print("Python exe:", sys.executable)
-import flask
-print("Flask OK, version:", flask.__version__)
-PY
+# --- Python deps ---
+python -m pip install --upgrade pip
+pip install --no-cache-dir -r requirements.txt
 
 echo "Build complete."
